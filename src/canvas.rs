@@ -2008,7 +2008,14 @@ fn draw_empty_hint(context: &Context, width: i32, height: i32, state: &CanvasSta
     let card_height = 88.0;
     let card_x = width as f64 / 2.0 - card_width / 2.0;
     let card_y = height as f64 / 2.0 - card_height / 2.0 - lift;
-    context.set_source_rgba(1.0, 1.0, 1.0, 0.55 * appear as f64);
+    let bg = state.page().canvas.background;
+    let luma = 0.2126 * bg.red + 0.7152 * bg.green + 0.0722 * bg.blue;
+    let card = if luma > 0.5 {
+        (1.0, 1.0, 1.0, 0.62)
+    } else {
+        (0.16, 0.18, 0.22, 0.72)
+    };
+    context.set_source_rgba(card.0, card.1, card.2, card.3 * appear as f64);
     rounded_rect(
         context,
         Rect {
@@ -2020,8 +2027,13 @@ fn draw_empty_hint(context: &Context, width: i32, height: i32, state: &CanvasSta
         18.0,
     );
     let _ = context.fill();
+    let (title_r, title_g, title_b) = if luma > 0.5 {
+        (0.22, 0.26, 0.32)
+    } else {
+        (0.93, 0.95, 0.97)
+    };
     context.set_font_size(20.0);
-    context.set_source_rgba(0.22, 0.26, 0.32, (0.82 * appear) as f64);
+    context.set_source_rgba(title_r, title_g, title_b, (0.88 * appear) as f64);
     if let Some(ext) = title_ext {
         context.move_to(
             width as f64 / 2.0 - ext.width() / 2.0 - ext.x_bearing(),
@@ -2030,7 +2042,7 @@ fn draw_empty_hint(context: &Context, width: i32, height: i32, state: &CanvasSta
         let _ = context.show_text(title);
     }
     context.set_font_size(13.0);
-    context.set_source_rgba(0.38, 0.42, 0.48, (0.72 * appear) as f64);
+    context.set_source_rgba(title_r, title_g, title_b, (0.62 * appear) as f64);
     if let Some(ext) = subtitle_ext {
         context.move_to(
             width as f64 / 2.0 - ext.width() / 2.0 - ext.x_bearing(),
