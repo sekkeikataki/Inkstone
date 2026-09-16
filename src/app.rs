@@ -101,6 +101,11 @@ fn install_css() {
             background-color: alpha(@window_bg_color, 0.88);
             border: 1px solid alpha(@borders, 0.42);
             box-shadow: 0 14px 36px alpha(black, 0.14);
+            transition: 180ms cubic-bezier(0.22, 1, 0.36, 1);
+        }
+        .floating-panel:hover {
+            border-color: alpha(@accent_bg_color, 0.4);
+            box-shadow: 0 16px 40px alpha(black, 0.16);
         }
         .tool-palette {
             border-radius: 28px;
@@ -113,9 +118,9 @@ fn install_css() {
         }
         .tool-button {
             border-radius: 999px;
-            min-width: 42px;
-            min-height: 42px;
-            padding: 9px;
+            min-width: 38px;
+            min-height: 38px;
+            padding: 8px;
             color: @window_fg_color;
             transition: 180ms cubic-bezier(0.22, 1, 0.36, 1);
         }
@@ -135,7 +140,7 @@ fn install_css() {
             -gtk-icon-transform: scale(1.0);
         }
         .tool-separator {
-            margin: 6px 10px;
+            margin: 4px 10px;
             opacity: 0.45;
         }
         .canvas-surface {
@@ -262,6 +267,7 @@ fn build_window(application: &adw::Application) {
     toast_overlay.set_child(Some(&split_view));
 
     let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.set_reveal_top_bars(false);
     let header = build_header(&window, &feedback.title);
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&toast_overlay));
@@ -278,6 +284,7 @@ fn build_window(application: &adw::Application) {
     );
     install_shortcuts(application);
     protect_unsaved_close(&window, &canvas);
+    play_chrome_entrance(&toolbar_view, &chrome);
     window.present();
     feedback.whisper("Ready — draw, type, or import");
 }
@@ -808,14 +815,14 @@ fn chrome_revealer(
 ) -> gtk::Revealer {
     let duration =
         if gtk::Settings::default().is_some_and(|settings| settings.is_gtk_enable_animations()) {
-            220
+            240
         } else {
             0
         };
     let revealer = gtk::Revealer::builder()
         .transition_type(transition)
         .transition_duration(duration)
-        .reveal_child(true)
+        .reveal_child(false)
         .halign(halign)
         .valign(valign)
         .child(child)
@@ -824,6 +831,30 @@ fn chrome_revealer(
         revealer.set_can_target(revealer.is_child_revealed());
     });
     revealer
+}
+
+fn play_chrome_entrance(toolbar: &adw::ToolbarView, chrome: &WorkspaceChrome) {
+    let animated =
+        gtk::Settings::default().is_some_and(|settings| settings.is_gtk_enable_animations());
+    toolbar.set_reveal_top_bars(false);
+    chrome.tools.set_reveal_child(false);
+    chrome.options.set_reveal_child(false);
+    chrome.status.set_reveal_child(false);
+    chrome.zoom.set_reveal_child(false);
+    let delay = if animated { 40 } else { 0 };
+    let toolbar = toolbar.clone();
+    let tools = chrome.tools.clone();
+    let options = chrome.options.clone();
+    let status = chrome.status.clone();
+    let zoom = chrome.zoom.clone();
+    glib::timeout_add_local(Duration::from_millis(delay), move || {
+        toolbar.set_reveal_top_bars(true);
+        tools.set_reveal_child(true);
+        options.set_reveal_child(true);
+        status.set_reveal_child(true);
+        zoom.set_reveal_child(true);
+        glib::ControlFlow::Break
+    });
 }
 
 fn wire_immersive_chrome(canvas: &Canvas, toolbar: &adw::ToolbarView, chrome: &WorkspaceChrome) {
@@ -853,7 +884,7 @@ fn wire_immersive_chrome(canvas: &Canvas, toolbar: &adw::ToolbarView, chrome: &W
             let status = status.clone();
             let zoom = zoom.clone();
             let generation = generation.clone();
-            glib::timeout_add_local(Duration::from_millis(160), move || {
+            glib::timeout_add_local(Duration::from_millis(200), move || {
                 if generation.get() == token {
                     toolbar.set_reveal_top_bars(true);
                     tools.set_reveal_child(true);
@@ -976,13 +1007,37 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
     tools.append(&shape);
     tools.append(&connector);
 
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    let top_space = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    top_space.set_vexpand(true);
+    let bottom_space = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    bottom_space.set_vexpand(true);
+    column.append(&top_space);
+    column.append(&tools);
+    column.append(&bottom_space);
+
+    let tools_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(true)
+        .overlay_scrolling(true)
+        .vexpand(true)
+        .hexpand(false)
+        .child(&column)
+        .build();
+    tools_scroll.set_width_request(54);
+
     let tools_revealer = chrome_revealer(
-        &tools,
+        &tools_scroll,
         gtk::RevealerTransitionType::SlideRight,
         gtk::Align::Start,
-        gtk::Align::Center,
+        gtk::Align::Fill,
     );
     tools_revealer.set_margin_start(14);
+    tools_revealer.set_margin_top(72);
+    tools_revealer.set_margin_bottom(64);
     let options_revealer = chrome_revealer(
         &options_frame,
         gtk::RevealerTransitionType::SlideDown,
@@ -1246,12 +1301,16 @@ fn select_options() -> gtk::Box {
         ("Duplicate", "edit-copy-symbolic", "win.duplicate"),
         ("Delete", "user-trash-symbolic", "win.delete"),
     ] {
-        let button = gtk::Button::builder()
-            .label(label)
+        let content = adw::ButtonContent::builder()
             .icon_name(icon)
+            .label(label)
+            .build();
+        let button = gtk::Button::builder()
+            .child(&content)
             .action_name(action)
             .build();
         button.add_css_class("flat");
+        button.add_css_class("pill");
         row.append(&button);
     }
     row
