@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Inkstone
+Comment=Infinite-canvas notes and schematic sketches
+Exec=inkstone
+Icon=accessories-text-editor
+Terminal=false
+Categories=Office;Graphics;
+Keywords=notes;drawing;stylus;schematic;
+StartupNotify=true
