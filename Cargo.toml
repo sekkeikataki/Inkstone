@@ -1,0 +1,26 @@
+[package]
+name = "inkstone"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A native infinite-canvas notebook for Linux"
+license = "MIT"
+
+[dependencies]
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
+base64 = "0.23.1"
+cairo-rs = { version = "0.22.9", features = ["pdf"] }
+gdk-pixbuf = "0.22.0"
+gtk4 = "0.11.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+uuid = { version = "1.20.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
