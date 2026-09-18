@@ -4,8 +4,8 @@ use crate::document::{
 };
 use crate::notebook::{Asset, Layer, Notebook, NotebookPage, SearchHit};
 use crate::spreadsheet::address::{CellAddr, CellRange, col_name};
-use crate::spreadsheet::formula::Value;
-use crate::spreadsheet::{Cell, HAlign, LayerKind, Spreadsheet};
+use crate::spreadsheet::formula::{EvalContext, Value};
+use crate::spreadsheet::{Cell, HAlign, LayerKind, Sheet, Spreadsheet, VAlign};
 use base64::Engine;
 use cairo::PdfSurface;
 use gdk_pixbuf::{Pixbuf, PixbufLoader};
@@ -404,7 +404,7 @@ impl Canvas {
                 context.scale(scale, scale);
                 for layer in page.layers.iter().filter(|layer| layer.visible) {
                     if let Some(spreadsheet) = &layer.spreadsheet {
-                        draw_spreadsheet(&context, &state, spreadsheet, layer.id, bounds);
+                        draw_spreadsheet(&context, &state, spreadsheet, layer.id, bounds, false);
                     }
                     for element in &layer.elements {
                         draw_element(&context, element, &state.image_cache);
@@ -764,7 +764,20 @@ impl Canvas {
     }
 
     pub fn commit_sheet_formula(&self) {
-        self.state.borrow_mut().commit_sheet_edit();
+        self.finish_sheet_formula(false);
+    }
+
+    pub fn commit_sheet_formula_and_move(&self) {
+        self.finish_sheet_formula(true);
+    }
+
+    fn finish_sheet_formula(&self, move_down: bool) {
+        let mut state = self.state.borrow_mut();
+        state.commit_sheet_edit();
+        if move_down {
+            state.move_sheet_selection(0, 1, false);
+        }
+        drop(state);
         self.schedule_autosave();
         self.emit_sheet_changed();
         self.area.queue_draw();
@@ -886,7 +899,7 @@ impl Canvas {
         let Some(range) = self.state.borrow().sheet_range else {
             return;
         };
-        self.mutate_sheet(|book| book.active_mut().sort_range(range, range.start.col, true));
+        self.mutate_sheet(|book| book.sort_range(range, range.start.col, true));
     }
 
     pub fn cycle_number_format(&self) {
@@ -940,6 +953,7 @@ impl Canvas {
         state.dirty = true;
         drop(state);
         self.schedule_autosave();
+        self.emit_sheet_changed();
         self.area.queue_draw();
     }
 
@@ -1742,7 +1756,9 @@ impl CanvasState {
             return;
         }
         if let Some(index) = book.hit_tab(world) {
-            if let Some(before) = self.capture_spreadsheet() {
+            if book.active_sheet != index
+                && let Some(before) = self.capture_spreadsheet()
+            {
                 if let Some(spreadsheet) = self.active_layer_mut().spreadsheet.as_mut() {
                     spreadsheet.active_sheet = index;
                 }
@@ -1783,10 +1799,14 @@ impl CanvasState {
             return;
         }
         if let Some(addr) = book.hit_cell(world) {
-            self.sheet_range = Some(CellRange::single(addr));
+            let range = book
+                .active()
+                .merge_containing(addr)
+                .unwrap_or_else(|| CellRange::single(addr));
+            self.sheet_range = Some(range);
             self.interaction = Some(Interaction::SheetSelect {
-                start: addr,
-                current: addr,
+                start: range.start,
+                current: range.end,
             });
         }
     }
@@ -2913,7 +2933,7 @@ fn draw_canvas(context: &Context, width: i32, height: i32, state: &CanvasState) 
 
     for layer in state.page().layers.iter().filter(|layer| layer.visible) {
         if let Some(spreadsheet) = &layer.spreadsheet {
-            draw_spreadsheet(context, state, spreadsheet, layer.id, viewport);
+            draw_spreadsheet(context, state, spreadsheet, layer.id, viewport, true);
         }
         for element in &layer.elements {
             if element
@@ -2991,12 +3011,30 @@ fn hit_fill_handle(book: &Spreadsheet, range: CellRange, point: Point) -> bool {
         && point.y <= handle.y + handle.height
 }
 
+fn merged_cell_box(sheet: &Sheet, xs: &[f32], ys: &[f32], addr: CellAddr) -> (f32, f32, f32, f32) {
+    let range = sheet
+        .merge_containing(addr)
+        .unwrap_or_else(|| CellRange::single(addr));
+    let x = xs.get(range.start.col as usize).copied().unwrap_or(0.0);
+    let y = ys.get(range.start.row as usize).copied().unwrap_or(0.0);
+    let right = xs
+        .get((range.end.col as usize).saturating_add(1))
+        .copied()
+        .unwrap_or(x);
+    let bottom = ys
+        .get((range.end.row as usize).saturating_add(1))
+        .copied()
+        .unwrap_or(y);
+    (x, y, (right - x).max(1.0), (bottom - y).max(1.0))
+}
+
 fn draw_spreadsheet(
     context: &Context,
     state: &CanvasState,
     book: &Spreadsheet,
     layer_id: Uuid,
     viewport: Rect,
+    interactive: bool,
 ) {
     let bounds = book.bounds();
     if !bounds.intersects(viewport.expand(24.0)) {
@@ -3070,42 +3108,50 @@ fn draw_spreadsheet(
         y += height;
     }
 
-    let selected = if active { state.sheet_range } else { None };
+    let selected = if interactive && active {
+        state.sheet_range
+    } else {
+        None
+    };
+    let xs = book.col_stops();
+    let ys = book.row_stops();
+    let mut eval = EvalContext::new(&book.sheets, book.active_sheet, CellAddr { col: 0, row: 0 });
+    let clip = viewport.expand(8.0);
     for col in 0..cols {
         for row in 0..rows {
             let addr = CellAddr { col, row };
-            let rect = book.cell_rect(addr);
-            if !rect.intersects(viewport.expand(8.0)) {
+            if sheet.merge_anchor(addr) != addr {
+                continue;
+            }
+            let (x, y, width, height) = merged_cell_box(sheet, &xs, &ys, addr);
+            if x + width < clip.x
+                || y + height < clip.y
+                || x > clip.x + clip.width
+                || y > clip.y + clip.height
+            {
                 continue;
             }
             let cell = sheet.cells.get(&addr);
             if let Some(fill) = cell.and_then(|cell| cell.style.fill) {
                 set_source(context, fill);
-                context.rectangle(
-                    rect.x as f64,
-                    rect.y as f64,
-                    rect.width as f64,
-                    rect.height as f64,
-                );
+                context.rectangle(x as f64, y as f64, width as f64, height as f64);
                 let _ = context.fill();
             }
             context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
             context.set_line_width(0.6 / state.zoom as f64);
-            context.rectangle(
-                rect.x as f64,
-                rect.y as f64,
-                rect.width as f64,
-                rect.height as f64,
-            );
+            context.rectangle(x as f64, y as f64, width as f64, height as f64);
             let _ = context.stroke();
             let editing = state
                 .sheet_editing
                 .as_ref()
                 .filter(|(edit_addr, _)| active && *edit_addr == addr);
-            let text = if let Some((_, buffer)) = editing {
-                buffer.clone()
+            let (text, value) = if let Some((_, buffer)) = editing {
+                (buffer.clone(), Value::Text(buffer.clone()))
+            } else if cell.is_none() {
+                continue;
             } else {
-                book.display_cell(book.active_sheet, addr)
+                let value = eval.evaluate_cell(book.active_sheet, addr);
+                (book.format_value(book.active_sheet, addr, &value), value)
             };
             if text.is_empty() {
                 continue;
@@ -3134,30 +3180,36 @@ fn draw_spreadsheet(
                 style.map(|style| style.text_color()).unwrap_or(Color::INK),
             );
             let align = style.map(|style| style.h_align).unwrap_or(HAlign::General);
-            let value = book.evaluate(book.active_sheet, addr);
             let numeric = matches!(value, Value::Number(_) | Value::Bool(_));
             let _ = context.save();
-            context.rectangle(
-                rect.x as f64,
-                rect.y as f64,
-                rect.width as f64,
-                rect.height as f64,
-            );
+            context.rectangle(x as f64, y as f64, width as f64, height as f64);
             context.clip();
-            let width = context
+            let text_width = context
                 .text_extents(&text)
                 .map(|ext| ext.width())
                 .unwrap_or(0.0);
             let text_x = match align {
-                HAlign::Center => rect.x as f64 + rect.width as f64 / 2.0 - width / 2.0,
-                HAlign::Right => rect.x as f64 + rect.width as f64 - 5.0 - width,
+                HAlign::Center => x as f64 + width as f64 / 2.0 - text_width / 2.0,
+                HAlign::Right => x as f64 + width as f64 - 5.0 - text_width,
                 HAlign::General if numeric && editing.is_none() => {
-                    rect.x as f64 + rect.width as f64 - 5.0 - width
+                    x as f64 + width as f64 - 5.0 - text_width
                 }
-                _ => rect.x as f64 + 4.0,
+                _ => x as f64 + 4.0,
             };
-            context.move_to(text_x, (rect.y + rect.height * 0.72) as f64);
+            let v_align = style.map(|style| style.v_align).unwrap_or(VAlign::Center);
+            let text_y = match v_align {
+                VAlign::Top => y as f64 + height as f64 * 0.42,
+                VAlign::Bottom => y as f64 + height as f64 * 0.88,
+                VAlign::Center => y as f64 + height as f64 * 0.72,
+            };
+            context.move_to(text_x, text_y);
             let _ = context.show_text(&text);
+            if style.is_some_and(|style| style.underline) {
+                context.set_line_width(1.0 / state.zoom as f64);
+                context.move_to(text_x, text_y + 1.5);
+                context.line_to(text_x + text_width, text_y + 1.5);
+                let _ = context.stroke();
+            }
             let _ = context.restore();
         }
     }

@@ -465,3 +465,114 @@ fn page_object_count_includes_spreadsheet_cells_in_search() {
     notebook.pages[0] = page;
     assert_eq!(notebook.search("winding").len(), 1);
 }
+
+#[test]
+fn insert_row_shifts_formulas_widths_and_merges() {
+    let mut book = Spreadsheet::new();
+    let sheet = book.active_mut();
+    sheet.set_input(CellAddr::parse_a1("A1").unwrap(), "10".into());
+    sheet.set_input(CellAddr::parse_a1("A2").unwrap(), "=A1*2".into());
+    sheet.set_col_width(0, 80.0);
+    sheet.set_row_height(1, 30.0);
+    sheet.merge_range(CellRange::parse("B2:C2").unwrap());
+    sheet.insert_rows(1, 1);
+
+    let sheet = book.active();
+    assert_eq!(sheet.cells[&CellAddr::parse_a1("A1").unwrap()].input, "10");
+    assert_eq!(
+        sheet.cells[&CellAddr::parse_a1("A3").unwrap()].input,
+        "=A1*2"
+    );
+    assert_eq!(sheet.col_width(0), 80.0);
+    assert_eq!(sheet.row_height(2), 30.0);
+    assert_eq!(
+        sheet.merge_containing(CellAddr::parse_a1("B3").unwrap()),
+        CellRange::parse("B3:C3")
+    );
+    assert_eq!(num(&[("A1", "10"), ("A2", "=A1*2")], "A2"), 20.0);
+}
+
+#[test]
+fn sort_uses_evaluated_formula_values() {
+    let mut book = book_with(&[("A1", "2"), ("A2", "1"), ("B1", "=A1*10"), ("B2", "=A2*10")]);
+    book.sort_range(CellRange::parse("A1:B2").unwrap(), 1, true);
+    assert_eq!(
+        book.active().cells[&CellAddr::parse_a1("A1").unwrap()].input,
+        "1"
+    );
+    assert_eq!(
+        book.active().cells[&CellAddr::parse_a1("B1").unwrap()].input,
+        "=A2*10"
+    );
+}
+
+#[test]
+fn merged_cells_share_an_anchor_and_can_unmerge() {
+    let mut sheet = Sheet::named("Sheet1");
+    sheet.set_input(CellAddr::parse_a1("A1").unwrap(), "title".into());
+    sheet.merge_range(CellRange::parse("A1:B2").unwrap());
+    assert_eq!(
+        sheet.merge_anchor(CellAddr::parse_a1("B2").unwrap()).a1(),
+        "A1"
+    );
+    sheet.merge_range(CellRange::parse("A1:B2").unwrap());
+    assert!(sheet.merged.is_empty());
+}
+
+#[test]
+fn clear_range_keeps_cell_formatting() {
+    let mut sheet = Sheet::named("Sheet1");
+    let addr = CellAddr::parse_a1("A1").unwrap();
+    sheet.cells.insert(
+        addr,
+        Cell {
+            input: "42".into(),
+            style: CellStyle {
+                bold: true,
+                ..CellStyle::default()
+            },
+        },
+    );
+    sheet.clear_range(CellRange::single(addr));
+    let cell = &sheet.cells[&addr];
+    assert!(cell.input.is_empty());
+    assert!(cell.style.bold);
+}
+
+#[test]
+fn formula_rewrite_and_lookup_and_find_match_excel() {
+    assert_eq!(adjust_formula("=A1", -1, 0), "=#REF!");
+    assert_eq!(
+        eval(
+            &[
+                ("A1", "10"),
+                ("A2", "20"),
+                ("B1", "a"),
+                ("B2", "b"),
+                ("C1", "=LOOKUP(15,A1:A2,B1:B2)")
+            ],
+            "C1"
+        ),
+        Value::Text("a".into())
+    );
+    assert_eq!(
+        eval(&[("A1", "=FIND(\"a\",\"😀abc\")")], "A1"),
+        Value::Number(2.0)
+    );
+    assert_eq!(
+        eval(
+            &[
+                ("A1", "1"),
+                ("A2", "2"),
+                ("A3", "3"),
+                ("B1", "10"),
+                ("B2", "20"),
+                ("C1", "=SUMIF(A1:A3,\">0\",B1:B2)"),
+            ],
+            "C1",
+        ),
+        Value::Error(ErrorKind::Value)
+    );
+    let serial = num(&[("A1", "=DATE(2024,2,30)")], "A1");
+    assert_eq!(num(&[("A1", "=DATE(2024,3,1)")], "A1"), serial);
+}

@@ -1474,7 +1474,7 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     });
     formula.connect_activate({
         let canvas = canvas.clone();
-        move |_| canvas.commit_sheet_formula()
+        move |_| canvas.commit_sheet_formula_and_move()
     });
     canvas.connect_sheet_changed({
         let canvas = canvas.clone();

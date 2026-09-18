@@ -173,6 +173,13 @@ impl CellRange {
             && addr.row <= self.end.row
     }
 
+    pub fn intersects(self, other: Self) -> bool {
+        self.start.col <= other.end.col
+            && self.end.col >= other.start.col
+            && self.start.row <= other.end.row
+            && self.end.row >= other.start.row
+    }
+
     pub fn cols(self) -> u32 {
         self.end.col - self.start.col + 1
     }

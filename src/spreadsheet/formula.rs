@@ -1,5 +1,6 @@
 use crate::spreadsheet::address::{CellAddr, CellRange, CellRef};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -855,19 +856,20 @@ fn rewrite_expr(expr: &Expr, dcol: i32, drow: i32) -> String {
         Expr::Literal(Value::Error(kind)) => kind.to_string(),
         Expr::Literal(Value::Empty) => String::new(),
         Expr::Literal(Value::Array(_)) => String::new(),
-        Expr::Ref { sheet, cell } => {
-            let next = cell.translate(dcol, drow).unwrap_or(*cell);
-            match sheet {
+        Expr::Ref { sheet, cell } => match cell.translate(dcol, drow) {
+            Some(next) => match sheet {
                 Some(sheet) => format!("{}!{}", quote_sheet(sheet), next.a1()),
                 None => next.a1(),
-            }
-        }
+            },
+            None => "#REF!".to_owned(),
+        },
         Expr::Range { sheet, start, end } => {
-            let start = start.translate(dcol, drow).unwrap_or(*start);
-            let end = end.translate(dcol, drow).unwrap_or(*end);
-            match sheet {
-                Some(sheet) => format!("{}!{}:{}", quote_sheet(sheet), start.a1(), end.a1()),
-                None => format!("{}:{}", start.a1(), end.a1()),
+            match (start.translate(dcol, drow), end.translate(dcol, drow)) {
+                (Some(start), Some(end)) => match sheet {
+                    Some(sheet) => format!("{}!{}:{}", quote_sheet(sheet), start.a1(), end.a1()),
+                    None => format!("{}:{}", start.a1(), end.a1()),
+                },
+                _ => "#REF!".to_owned(),
             }
         }
         Expr::UnaryMinus(inner) => format!("-{}", rewrite_expr(inner, dcol, drow)),
@@ -888,6 +890,95 @@ fn rewrite_expr(expr: &Expr, dcol: i32, drow: i32) -> String {
                 .join(",")
         ),
     }
+}
+
+pub fn shift_formula(input: &str, col0: u32, row0: u32, dcol: i32, drow: i32) -> String {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('=') {
+        return input.to_owned();
+    }
+    let Ok(expr) = parse_formula(trimmed) else {
+        return input.to_owned();
+    };
+    format!("={}", shift_expr(&expr, col0, row0, dcol, drow))
+}
+
+fn shift_expr(expr: &Expr, col0: u32, row0: u32, dcol: i32, drow: i32) -> String {
+    match expr {
+        Expr::Literal(Value::Number(value)) => format_general(*value),
+        Expr::Literal(Value::Text(text)) => format!("\"{}\"", text.replace('"', "\"\"")),
+        Expr::Literal(Value::Bool(true)) => "TRUE".to_owned(),
+        Expr::Literal(Value::Bool(false)) => "FALSE".to_owned(),
+        Expr::Literal(Value::Error(kind)) => kind.to_string(),
+        Expr::Literal(Value::Empty | Value::Array(_)) => String::new(),
+        Expr::Ref { sheet, cell } => match shift_cell_ref(*cell, col0, row0, dcol, drow) {
+            Some(next) => match sheet {
+                Some(sheet) => format!("{}!{}", quote_sheet(sheet), next.a1()),
+                None => next.a1(),
+            },
+            None => "#REF!".to_owned(),
+        },
+        Expr::Range { sheet, start, end } => {
+            match (
+                shift_cell_ref(*start, col0, row0, dcol, drow),
+                shift_cell_ref(*end, col0, row0, dcol, drow),
+            ) {
+                (Some(start), Some(end)) => match sheet {
+                    Some(sheet) => format!("{}!{}:{}", quote_sheet(sheet), start.a1(), end.a1()),
+                    None => format!("{}:{}", start.a1(), end.a1()),
+                },
+                _ => "#REF!".to_owned(),
+            }
+        }
+        Expr::UnaryMinus(inner) => format!("-{}", shift_expr(inner, col0, row0, dcol, drow)),
+        Expr::UnaryPlus(inner) => format!("+{}", shift_expr(inner, col0, row0, dcol, drow)),
+        Expr::Percent(inner) => format!("{}%", shift_expr(inner, col0, row0, dcol, drow)),
+        Expr::Binary(op, left, right) => format!(
+            "{}{}{}",
+            shift_expr(left, col0, row0, dcol, drow),
+            bin_op_symbol(*op),
+            shift_expr(right, col0, row0, dcol, drow)
+        ),
+        Expr::Call(name, args) => format!(
+            "{}({})",
+            name.to_ascii_uppercase(),
+            args.iter()
+                .map(|arg| shift_expr(arg, col0, row0, dcol, drow))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn shift_cell_ref(cell: CellRef, col0: u32, row0: u32, dcol: i32, drow: i32) -> Option<CellRef> {
+    if dcol < 0 && cell.col >= col0 && cell.col < col0 + dcol.unsigned_abs() {
+        return None;
+    }
+    if drow < 0 && cell.row >= row0 && cell.row < row0 + drow.unsigned_abs() {
+        return None;
+    }
+    let mut col = cell.col;
+    let mut row = cell.row;
+    if dcol != 0 && cell.col >= col0 {
+        let next = i64::from(col) + i64::from(dcol);
+        if next < 0 {
+            return None;
+        }
+        col = next as u32;
+    }
+    if drow != 0 && cell.row >= row0 {
+        let next = i64::from(row) + i64::from(drow);
+        if next < 0 {
+            return None;
+        }
+        row = next as u32;
+    }
+    CellAddr::new(col, row).map(|addr| CellRef {
+        col: addr.col,
+        row: addr.row,
+        col_abs: cell.col_abs,
+        row_abs: cell.row_abs,
+    })
 }
 
 fn quote_sheet(name: &str) -> String {
@@ -924,6 +1015,7 @@ pub struct EvalContext<'a> {
     pub sheet_index: usize,
     pub current: CellAddr,
     visiting: Vec<(usize, CellAddr)>,
+    cache: HashMap<(usize, CellAddr), Value>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -933,38 +1025,46 @@ impl<'a> EvalContext<'a> {
             sheet_index,
             current,
             visiting: Vec::new(),
+            cache: HashMap::new(),
         }
     }
 
     pub fn evaluate_cell(&mut self, sheet_index: usize, addr: CellAddr) -> Value {
-        if let Some(sheet) = self.sheets.get(sheet_index)
+        if let Some(cached) = self.cache.get(&(sheet_index, addr)) {
+            return cached.clone();
+        }
+        let value = if let Some(sheet) = self.sheets.get(sheet_index)
             && let Some(cell) = sheet.cells.get(&addr)
         {
             if !cell.input.trim_start().starts_with('=') {
-                return parse_literal(&cell.input);
+                parse_literal(&cell.input)
+            } else if self.visiting.contains(&(sheet_index, addr)) {
+                Value::Error(ErrorKind::Circ)
+            } else {
+                self.visiting.push((sheet_index, addr));
+                let value = match parse_formula(&cell.input) {
+                    Ok(expr) => {
+                        let previous = self.sheet_index;
+                        let previous_cell = self.current;
+                        self.sheet_index = sheet_index;
+                        self.current = addr;
+                        let value = eval_expr(&expr, self);
+                        self.sheet_index = previous;
+                        self.current = previous_cell;
+                        value
+                    }
+                    Err(kind) => Value::Error(kind),
+                };
+                self.visiting.pop();
+                value
             }
-            if self.visiting.contains(&(sheet_index, addr)) {
-                return Value::Error(ErrorKind::Circ);
-            }
-            self.visiting.push((sheet_index, addr));
-            let value = match parse_formula(&cell.input) {
-                Ok(expr) => {
-                    let previous = self.sheet_index;
-                    let previous_cell = self.current;
-                    self.sheet_index = sheet_index;
-                    self.current = addr;
-                    let value = eval_expr(&expr, self);
-                    self.sheet_index = previous;
-                    self.current = previous_cell;
-                    value
-                }
-                Err(kind) => Value::Error(kind),
-            };
-            self.visiting.pop();
-            value
         } else {
             Value::Empty
+        };
+        if !matches!(value, Value::Error(ErrorKind::Circ)) {
+            self.cache.insert((sheet_index, addr), value.clone());
         }
+        value
     }
 }
 
@@ -1118,11 +1218,6 @@ fn eval_binary(op: BinOp, left: Value, right: Value) -> Value {
 
 fn eval_call(name: &str, args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
     let name = name.to_ascii_uppercase();
-    let values = || {
-        args.iter()
-            .map(|arg| eval_expr(arg, ctx))
-            .collect::<Vec<_>>()
-    };
     match name.as_str() {
         "SUM" => reduce_numbers(args, ctx, 0.0, |acc, n| acc + n),
         "PRODUCT" => reduce_numbers(args, ctx, 1.0, |acc, n| acc * n),
@@ -1420,17 +1515,14 @@ fn eval_call(name: &str, args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
         "SECOND" => time_part(args, ctx, 2),
         "TRANSPOSE" => eval_transpose(args, ctx),
         "SEQUENCE" => eval_sequence(args, ctx),
-        "LOOKUP" => eval_lookup(args, ctx, true),
+        "LOOKUP" => eval_lookup_vector(args, ctx),
         "ISLOGICAL" => Value::Bool(matches!(eval_optional(args, 0, ctx), Value::Bool(_))),
         "ISERR" => {
             let err = eval_optional(args, 0, ctx).error();
             Value::Bool(err.is_some() && err != Some(ErrorKind::Na))
         }
         "ISFORMULA" => eval_isformula(args, ctx),
-        _ => {
-            let _ = values;
-            Value::Error(ErrorKind::Name)
-        }
+        _ => Value::Error(ErrorKind::Name),
     }
 }
 
@@ -1805,21 +1897,23 @@ fn eval_find(args: &[Expr], ctx: &mut EvalContext<'_>, case_sensitive: bool) -> 
                 return Value::Error(ErrorKind::Value);
             }
             let skip = (start as usize).saturating_sub(1);
-            let hay = if case_sensitive {
-                haystack.clone()
+            let sliced: String = haystack.chars().skip(skip).collect();
+            let search = if case_sensitive {
+                sliced
             } else {
-                haystack.to_ascii_lowercase()
+                sliced.to_lowercase()
             };
             let needle = if case_sensitive {
                 needle
             } else {
-                needle.to_ascii_lowercase()
+                needle.to_lowercase()
             };
-            hay.chars()
-                .skip(skip)
-                .collect::<String>()
+            search
                 .find(&needle)
-                .map(|index| Value::Number((skip + index + 1) as f64))
+                .map(|byte_index| {
+                    let chars_into = search[..byte_index].chars().count();
+                    Value::Number((skip + chars_into + 1) as f64)
+                })
                 .unwrap_or(Value::Error(ErrorKind::Value))
         }
         (Err(kind), _) | (_, Err(kind)) => Value::Error(kind),
@@ -1980,6 +2074,9 @@ fn eval_conditional(args: &[Expr], ctx: &mut EvalContext<'_>, kind: CondKind) ->
     let Ok(nums) = values.flatten() else {
         return Value::Error(ErrorKind::Value);
     };
+    if tests.len() != nums.len() {
+        return Value::Error(ErrorKind::Value);
+    }
     let mut sum = 0.0;
     let mut count = 0usize;
     for (test, value) in tests.into_iter().zip(nums) {
@@ -2036,6 +2133,93 @@ fn criteria_match(value: &Value, criteria: &Value) -> bool {
             Value::Bool(true)
         ),
     }
+}
+
+fn eval_lookup_vector(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let lookup = eval_optional(args, 0, ctx);
+    let table = eval_optional(args, 1, ctx);
+    let result = if args.len() > 2 {
+        Some(eval_optional(args, 2, ctx))
+    } else {
+        None
+    };
+    let (keys, values) = match (&table, &result) {
+        (Value::Array(rows), Some(result)) => {
+            let keys = flatten_lookup_vector(rows);
+            let Ok(values) = result.flatten() else {
+                return Value::Error(ErrorKind::Value);
+            };
+            (keys, values)
+        }
+        (Value::Array(rows), None) => lookup_array_vectors(rows),
+        (other, Some(result)) => {
+            let Ok(keys) = other.flatten() else {
+                return Value::Error(ErrorKind::Value);
+            };
+            let Ok(values) = result.flatten() else {
+                return Value::Error(ErrorKind::Value);
+            };
+            (keys, values)
+        }
+        (other, None) => {
+            let Ok(keys) = other.flatten() else {
+                return Value::Error(ErrorKind::Value);
+            };
+            (keys.clone(), keys)
+        }
+    };
+    if keys.is_empty() || keys.len() != values.len() {
+        return Value::Error(ErrorKind::Value);
+    }
+    approx_lookup_index(&keys, &lookup)
+        .and_then(|index| values.get(index).cloned())
+        .unwrap_or(Value::Error(ErrorKind::Na))
+}
+
+fn flatten_lookup_vector(rows: &[Vec<Value>]) -> Vec<Value> {
+    if rows.len() == 1 {
+        rows[0].clone()
+    } else {
+        rows.iter().filter_map(|row| row.first().cloned()).collect()
+    }
+}
+
+fn lookup_array_vectors(rows: &[Vec<Value>]) -> (Vec<Value>, Vec<Value>) {
+    let height = rows.len();
+    let width = rows.first().map(Vec::len).unwrap_or(0);
+    if height >= width {
+        let keys = rows
+            .iter()
+            .filter_map(|row| row.first().cloned())
+            .collect::<Vec<_>>();
+        let values = rows
+            .iter()
+            .filter_map(|row| row.last().cloned())
+            .collect::<Vec<_>>();
+        (keys, values)
+    } else {
+        let keys = rows.first().cloned().unwrap_or_default();
+        let values = rows.last().cloned().unwrap_or_default();
+        (keys, values)
+    }
+}
+
+fn approx_lookup_index(keys: &[Value], lookup: &Value) -> Option<usize> {
+    let mut last = None;
+    for (index, key) in keys.iter().enumerate() {
+        if excel_equal(key, lookup) {
+            return Some(index);
+        }
+        if let (Ok(a), Ok(b)) = (key.comparable(), lookup.comparable())
+            && matches!(
+                a.cmp_excel(&b),
+                Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            )
+        {
+            last = Some(index);
+        }
+    }
+    last
 }
 
 fn eval_lookup(args: &[Expr], ctx: &mut EvalContext<'_>, vertical: bool) -> Value {
@@ -2099,10 +2283,16 @@ fn eval_lookup(args: &[Expr], ctx: &mut EvalContext<'_>, vertical: bool) -> Valu
 }
 
 fn excel_equal(left: &Value, right: &Value) -> bool {
-    matches!(
-        eval_binary(BinOp::Eq, left.clone(), right.clone()),
-        Value::Bool(true)
-    )
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Text(a), Value::Text(b)) => a.eq_ignore_ascii_case(b),
+        (Value::Empty, Value::Empty) => true,
+        _ => matches!(
+            eval_binary(BinOp::Eq, left.clone(), right.clone()),
+            Value::Bool(true)
+        ),
+    }
 }
 
 fn eval_index(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
@@ -2410,10 +2600,10 @@ fn excel_serial_now() -> f64 {
 }
 
 fn ymd_to_serial(year: i32, month: i32, day: i32) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some(days_from_civil(year, month as u32, day as u32) + 25_569)
+    let zero_month = month - 1;
+    let year = year + zero_month.div_euclid(12);
+    let month = zero_month.rem_euclid(12) + 1;
+    Some(days_from_civil(year, month as u32, 1) + i64::from(day - 1) + 25_569)
 }
 
 pub(crate) fn serial_ymd(serial: i64) -> Option<(i32, i32, i32)> {

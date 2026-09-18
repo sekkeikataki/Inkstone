@@ -5,7 +5,7 @@ pub mod formula;
 use crate::document::{Color, DocumentError, Point, Rect};
 use crate::spreadsheet::address::{CellAddr, CellRange, MAX_COLS, MAX_ROWS, col_name, parse_col};
 use crate::spreadsheet::formula::{
-    EvalContext, Value, adjust_formula, parse_formula, parse_literal,
+    EvalContext, Value, adjust_formula, parse_formula, parse_literal, shift_formula,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -319,24 +319,34 @@ impl Sheet {
 
     pub fn clear_range(&mut self, range: CellRange) {
         for addr in range.cells() {
-            self.cells.remove(&addr);
+            self.set_input(addr, String::new());
         }
     }
 
     pub fn merge_range(&mut self, range: CellRange) {
-        self.merged
-            .retain(|existing| !existing.contains(range.start));
-        if range.start != range.end {
+        if range.start == range.end {
+            self.merged
+                .retain(|existing| !existing.contains(range.start));
+            return;
+        }
+        let exact = self.merged.contains(&range);
+        self.merged.retain(|existing| !existing.intersects(range));
+        if !exact {
             self.merged.push(range);
         }
     }
 
     pub fn merge_anchor(&self, addr: CellAddr) -> CellAddr {
-        self.merged
-            .iter()
-            .find(|range| range.contains(addr))
+        self.merge_containing(addr)
             .map(|range| range.start)
             .unwrap_or(addr)
+    }
+
+    pub fn merge_containing(&self, addr: CellAddr) -> Option<CellRange> {
+        self.merged
+            .iter()
+            .copied()
+            .find(|range| range.contains(addr))
     }
 
     pub fn insert_rows(&mut self, before: u32, count: u32) {
@@ -357,40 +367,44 @@ impl Sheet {
 
     fn shift(&mut self, col0: u32, row0: u32, dcol: i32, drow: i32) {
         let mut next = BTreeMap::new();
-        for (addr, mut cell) in std::mem::take(&mut self.cells) {
-            if (dcol < 0 && addr.col >= col0 && addr.col < col0 + dcol.unsigned_abs())
-                || (drow < 0 && addr.row >= row0 && addr.row < row0 + drow.unsigned_abs())
-            {
-                continue;
-            }
-            let mut col = addr.col;
-            let mut row = addr.row;
-            if addr.col >= col0 {
-                let shifted = i64::from(col) + i64::from(dcol);
-                if shifted < 0 {
-                    continue;
-                }
-                col = shifted as u32;
-            }
-            if addr.row >= row0 {
-                let shifted = i64::from(row) + i64::from(drow);
-                if shifted < 0 {
-                    continue;
-                }
-                row = shifted as u32;
-            }
-            if let Some(new_addr) = CellAddr::new(col, row) {
-                if cell.is_formula() {
-                    cell.input = adjust_formula(
-                        &cell.input,
-                        if addr.col >= col0 { dcol } else { 0 },
-                        if addr.row >= row0 { drow } else { 0 },
-                    );
-                }
+        for (addr, cell) in std::mem::take(&mut self.cells) {
+            if let Some(new_addr) = shift_addr(addr, col0, row0, dcol, drow) {
                 next.insert(new_addr, cell);
             }
         }
         self.cells = next;
+        for cell in self.cells.values_mut() {
+            if cell.is_formula() {
+                cell.input = shift_formula(&cell.input, col0, row0, dcol, drow);
+            }
+        }
+        self.column_widths = shift_index_map(std::mem::take(&mut self.column_widths), col0, dcol);
+        self.row_heights = shift_index_map(std::mem::take(&mut self.row_heights), row0, drow);
+        self.merged = self
+            .merged
+            .drain(..)
+            .filter_map(|range| shift_range(range, col0, row0, dcol, drow))
+            .collect();
+        if drow != 0 && row0 < self.frozen_rows {
+            self.frozen_rows = i64::from(self.frozen_rows)
+                .saturating_add(i64::from(drow))
+                .max(0) as u32;
+        }
+        if dcol != 0 && col0 < self.frozen_cols {
+            self.frozen_cols = i64::from(self.frozen_cols)
+                .saturating_add(i64::from(dcol))
+                .max(0) as u32;
+        }
+        if dcol > 0 {
+            self.visible_cols = self.visible_cols.saturating_add(dcol as u32).min(MAX_COLS);
+        } else if dcol < 0 {
+            self.visible_cols = self.visible_cols.saturating_sub(dcol.unsigned_abs()).max(1);
+        }
+        if drow > 0 {
+            self.visible_rows = self.visible_rows.saturating_add(drow as u32).min(MAX_ROWS);
+        } else if drow < 0 {
+            self.visible_rows = self.visible_rows.saturating_sub(drow.unsigned_abs()).max(1);
+        }
     }
 
     pub fn copy_range(&self, range: CellRange, dcol: i32, drow: i32) -> Vec<(CellAddr, Cell)> {
@@ -490,14 +504,14 @@ impl Sheet {
         }
         rows.sort_by(|a, b| {
             let offset = key_col.saturating_sub(range.start.col) as usize;
-            let left = a.get(offset).map(|(_, cell)| parse_literal(&cell.input));
-            let right = b.get(offset).map(|(_, cell)| parse_literal(&cell.input));
+            let left = a.get(offset).map(|(_, cell)| &cell.input);
+            let right = b.get(offset).map(|(_, cell)| &cell.input);
             match (left, right) {
                 (Some(l), Some(r)) => {
-                    let order = l
+                    let order = parse_literal(l)
                         .comparable()
                         .ok()
-                        .zip(r.comparable().ok())
+                        .zip(parse_literal(r).comparable().ok())
                         .and_then(|(a, b)| a.cmp_excel(&b).ok())
                         .unwrap_or(std::cmp::Ordering::Equal);
                     if ascending { order } else { order.reverse() }
@@ -506,6 +520,45 @@ impl Sheet {
             }
         });
         for (index, row_cells) in rows.into_iter().enumerate() {
+            let row = range.start.row + index as u32;
+            for (source, cell) in row_cells {
+                if !cell.input.is_empty() || !is_default_style(&cell.style) {
+                    self.cells.insert(
+                        CellAddr {
+                            col: source.col,
+                            row,
+                        },
+                        cell,
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn sort_evaluated(&mut self, range: CellRange, keys: &[Value], ascending: bool) {
+        let mut rows: Vec<(Value, Vec<(CellAddr, Cell)>)> = Vec::new();
+        for (index, row) in (range.start.row..=range.end.row).enumerate() {
+            let mut cells = Vec::new();
+            for col in range.start.col..=range.end.col {
+                let addr = CellAddr { col, row };
+                if let Some(cell) = self.cells.remove(&addr) {
+                    cells.push((addr, cell));
+                } else {
+                    cells.push((addr, Cell::default()));
+                }
+            }
+            rows.push((keys.get(index).cloned().unwrap_or(Value::Empty), cells));
+        }
+        rows.sort_by(|a, b| {
+            let order =
+                a.0.comparable()
+                    .ok()
+                    .zip(b.0.comparable().ok())
+                    .and_then(|(l, r)| l.cmp_excel(&r).ok())
+                    .unwrap_or(std::cmp::Ordering::Equal);
+            if ascending { order } else { order.reverse() }
+        });
+        for (index, (_, row_cells)) in rows.into_iter().enumerate() {
             let row = range.start.row + index as u32;
             for (source, cell) in row_cells {
                 if !cell.input.is_empty() || !is_default_style(&cell.style) {
@@ -586,14 +639,62 @@ impl Spreadsheet {
     }
 
     pub fn display_cell(&self, sheet_index: usize, addr: CellAddr) -> String {
-        let value = self.evaluate(sheet_index, addr);
+        let mut ctx = EvalContext::new(&self.sheets, sheet_index, addr);
+        self.display_with(&mut ctx, sheet_index, addr)
+    }
+
+    pub fn display_with(
+        &self,
+        ctx: &mut EvalContext<'_>,
+        sheet_index: usize,
+        addr: CellAddr,
+    ) -> String {
+        let value = ctx.evaluate_cell(sheet_index, addr);
+        self.format_value(sheet_index, addr, &value)
+    }
+
+    pub fn format_value(&self, sheet_index: usize, addr: CellAddr, value: &Value) -> String {
         let format = self
             .sheets
             .get(sheet_index)
             .and_then(|sheet| sheet.cells.get(&addr))
             .map(|cell| cell.style.number_format.as_str())
             .unwrap_or("");
-        format::format_cell(&value, format)
+        format::format_cell(value, format)
+    }
+
+    pub fn sort_range(&mut self, range: CellRange, key_col: u32, ascending: bool) {
+        let sheet_index = self.active_sheet;
+        let keys: Vec<Value> = (range.start.row..=range.end.row)
+            .map(|row| self.evaluate(sheet_index, CellAddr { col: key_col, row }))
+            .collect();
+        self.active_mut().sort_evaluated(range, &keys, ascending);
+    }
+
+    pub fn col_stops(&self) -> Vec<f32> {
+        let sheet = self.active();
+        let cols = sheet.display_cols();
+        let mut xs = Vec::with_capacity(cols as usize + 1);
+        let mut x = self.origin.x + HEADER_COL_WIDTH;
+        xs.push(x);
+        for col in 0..cols {
+            x += sheet.col_width(col);
+            xs.push(x);
+        }
+        xs
+    }
+
+    pub fn row_stops(&self) -> Vec<f32> {
+        let sheet = self.active();
+        let rows = sheet.display_rows();
+        let mut ys = Vec::with_capacity(rows as usize + 1);
+        let mut y = self.origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
+        ys.push(y);
+        for row in 0..rows {
+            y += sheet.row_height(row);
+            ys.push(y);
+        }
+        ys
     }
 
     pub fn set_active_input(&mut self, addr: CellAddr, input: String) -> Result<(), DocumentError> {
@@ -916,10 +1017,32 @@ impl Spreadsheet {
         ));
         let cols = sheet.display_cols().min(256);
         let rows = sheet.display_rows().min(256);
+        let xs = self.col_stops();
+        let ys = self.row_stops();
+        let mut ctx =
+            EvalContext::new(&self.sheets, self.active_sheet, CellAddr { col: 0, row: 0 });
         for col in 0..cols {
             for row in 0..rows {
                 let addr = CellAddr { col, row };
-                let rect = self.cell_rect(addr);
+                if sheet.merge_anchor(addr) != addr {
+                    continue;
+                }
+                let (x, y, width, height) = if let Some(merge) = sheet.merge_containing(addr) {
+                    let x = xs.get(merge.start.col as usize).copied().unwrap_or(0.0);
+                    let y = ys.get(merge.start.row as usize).copied().unwrap_or(0.0);
+                    let right = xs.get((merge.end.col + 1) as usize).copied().unwrap_or(x);
+                    let bottom = ys.get((merge.end.row + 1) as usize).copied().unwrap_or(y);
+                    (x, y, right - x, bottom - y)
+                } else {
+                    let x = xs.get(col as usize).copied().unwrap_or(0.0);
+                    let y = ys.get(row as usize).copied().unwrap_or(0.0);
+                    (
+                        x,
+                        y,
+                        xs.get((col + 1) as usize).copied().unwrap_or(x) - x,
+                        ys.get((row + 1) as usize).copied().unwrap_or(y) - y,
+                    )
+                };
                 let fill = sheet
                     .cells
                     .get(&addr)
@@ -927,15 +1050,17 @@ impl Spreadsheet {
                     .map(|color| color.svg())
                     .unwrap_or_else(|| "#ffffff".to_owned());
                 svg.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"{fill}\" stroke=\"#d8dde6\" stroke-width=\"0.6\"/>\n",
-                    rect.x, rect.y, rect.width, rect.height
+                    "<rect x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" fill=\"{fill}\" stroke=\"#d8dde6\" stroke-width=\"0.6\"/>\n"
                 ));
-                let text = self.display_cell(self.active_sheet, addr);
+                if !sheet.cells.contains_key(&addr) {
+                    continue;
+                }
+                let text = self.display_with(&mut ctx, self.active_sheet, addr);
                 if !text.is_empty() {
                     svg.push_str(&format!(
                         "<text x=\"{}\" y=\"{}\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#222222\">{}</text>\n",
-                        rect.x + 4.0,
-                        rect.y + rect.height * 0.72,
+                        x + 4.0,
+                        y + height * 0.72,
                         crate::document::escape_xml(&text)
                     ));
                 }
@@ -944,6 +1069,61 @@ impl Spreadsheet {
         svg.push_str("</g>\n");
         svg
     }
+}
+
+fn shift_addr(addr: CellAddr, col0: u32, row0: u32, dcol: i32, drow: i32) -> Option<CellAddr> {
+    if dcol < 0 && addr.col >= col0 && addr.col < col0 + dcol.unsigned_abs() {
+        return None;
+    }
+    if drow < 0 && addr.row >= row0 && addr.row < row0 + drow.unsigned_abs() {
+        return None;
+    }
+    let mut col = addr.col;
+    let mut row = addr.row;
+    if dcol != 0 && addr.col >= col0 {
+        let shifted = i64::from(col) + i64::from(dcol);
+        if shifted < 0 {
+            return None;
+        }
+        col = shifted as u32;
+    }
+    if drow != 0 && addr.row >= row0 {
+        let shifted = i64::from(row) + i64::from(drow);
+        if shifted < 0 {
+            return None;
+        }
+        row = shifted as u32;
+    }
+    CellAddr::new(col, row)
+}
+
+fn shift_range(range: CellRange, col0: u32, row0: u32, dcol: i32, drow: i32) -> Option<CellRange> {
+    Some(CellRange::new(
+        shift_addr(range.start, col0, row0, dcol, drow)?,
+        shift_addr(range.end, col0, row0, dcol, drow)?,
+    ))
+}
+
+fn shift_index_map<T>(map: BTreeMap<u32, T>, start: u32, delta: i32) -> BTreeMap<u32, T> {
+    if delta == 0 {
+        return map;
+    }
+    let mut next = BTreeMap::new();
+    for (index, value) in map {
+        if delta < 0 && index >= start && index < start + delta.unsigned_abs() {
+            continue;
+        }
+        let mut shifted = index;
+        if index >= start {
+            let next_index = i64::from(index) + i64::from(delta);
+            if next_index < 0 {
+                continue;
+            }
+            shifted = next_index as u32;
+        }
+        next.insert(shifted, value);
+    }
+    next
 }
 
 fn serialize_cells<S: Serializer>(
