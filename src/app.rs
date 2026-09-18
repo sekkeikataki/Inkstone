@@ -174,7 +174,7 @@ fn install_css() {
             font-family: monospace;
         }
         .sheet-formula {
-            min-width: 18em;
+            min-width: 12em;
         }
         .swatch-ink { background-color: #1a1f29; }
         .swatch-blue { background-color: #1f61e0; }
@@ -1458,7 +1458,7 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     let formula = gtk::Entry::builder()
         .placeholder_text("=SUM(A1:A10)")
         .tooltip_text("Formula bar · Enter commits, F2 edits on the canvas")
-        .width_chars(22)
+        .width_chars(16)
         .build();
     formula.add_css_class("sheet-formula");
     let updating = Rc::new(Cell::new(false));
@@ -1612,11 +1612,11 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     row.append(&option_hint("fx"));
     row.append(&addr);
     row.append(&formula);
+    row.append(&bold);
+    row.append(&italic);
+    row.append(&align);
+    row.append(&percent);
     let tools = option_row();
-    tools.append(&bold);
-    tools.append(&italic);
-    tools.append(&align);
-    tools.append(&percent);
     tools.append(&fill);
     tools.append(&merge);
     tools.append(&sort);

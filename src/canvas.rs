@@ -681,6 +681,7 @@ impl Canvas {
         state.dirty = true;
         drop(state);
         self.schedule_autosave();
+        self.frame_active_spreadsheet();
         self.emit_sheet_changed();
         self.area.queue_draw();
     }
@@ -947,6 +948,38 @@ impl Canvas {
             .borrow_mut()
             .sheet_listeners
             .push(Rc::new(callback));
+    }
+
+    fn frame_active_spreadsheet(&self) {
+        let width = self.area.width() as f32;
+        let height = self.area.height() as f32;
+        if width < 80.0 || height < 80.0 {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let Some(bounds) = state
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .map(Spreadsheet::bounds)
+        else {
+            return;
+        };
+        let pad_x = 108.0;
+        let pad_y = 96.0;
+        let avail_w = (width - pad_x * 2.0).max(160.0);
+        let avail_h = (height - pad_y * 2.0).max(120.0);
+        let zoom = (avail_w / bounds.width.max(1.0))
+            .min(avail_h / bounds.height.max(1.0))
+            .clamp(MIN_ZOOM, 1.0);
+        state.view_animation_generation = state.view_animation_generation.wrapping_add(1);
+        state.zoom = zoom;
+        state.pan = Point::new(
+            width / 2.0 - (bounds.x + bounds.width / 2.0) * zoom,
+            height / 2.0 - (bounds.y + bounds.height / 2.0) * zoom,
+        );
+        drop(state);
+        self.emit_view_changed();
     }
 
     fn emit_sheet_changed(&self) {
@@ -3161,16 +3194,6 @@ fn draw_spreadsheet(
         let _ = context.fill();
     }
 
-    let grow = book.grow_handle_rect();
-    context.set_source_rgb(0.18, 0.42, 0.28);
-    context.rectangle(
-        grow.x as f64,
-        grow.y as f64,
-        grow.width as f64,
-        grow.height as f64,
-    );
-    let _ = context.fill();
-
     let tab_top = bounds.y + bounds.height - crate::spreadsheet::TAB_HEIGHT;
     context.set_source_rgb(0.94, 0.95, 0.94);
     context.rectangle(
@@ -3196,6 +3219,14 @@ fn draw_spreadsheet(
         let _ = context.show_text(&tab.name);
         tab_x += width + 6.0;
     }
+
+    let grow = book.grow_handle_rect();
+    context.set_source_rgb(0.18, 0.42, 0.28);
+    context.move_to(grow.x as f64, (grow.y + grow.height) as f64);
+    context.line_to((grow.x + grow.width) as f64, (grow.y + grow.height) as f64);
+    context.line_to((grow.x + grow.width) as f64, grow.y as f64);
+    context.close_path();
+    let _ = context.fill();
 }
 
 fn draw_interaction(context: &Context, state: &CanvasState) {

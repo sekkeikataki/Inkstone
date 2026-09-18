@@ -19,7 +19,7 @@ pub const TITLE_HEIGHT: f32 = 26.0;
 pub const TAB_HEIGHT: f32 = 22.0;
 pub const MIN_DISPLAY_COLS: u32 = 10;
 pub const MIN_DISPLAY_ROWS: u32 = 10;
-pub const GROW_HANDLE: f32 = 10.0;
+pub const GROW_HANDLE: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -778,10 +778,9 @@ impl Spreadsheet {
 
     pub fn grow_handle_rect(&self) -> Rect {
         let bounds = self.bounds();
-        let grid_bottom = bounds.y + bounds.height - TAB_HEIGHT;
         Rect {
             x: bounds.x + bounds.width - GROW_HANDLE,
-            y: grid_bottom - GROW_HANDLE,
+            y: bounds.y + bounds.height - GROW_HANDLE,
             width: GROW_HANDLE,
             height: GROW_HANDLE,
         }
