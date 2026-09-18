@@ -8,9 +8,10 @@ view a page, add ink or a text note, and edit spreadsheet cells on a phone.
 - Open an existing notebook from Files, Drive, or a share/`VIEW` intent
 - Create a new blank notebook
 - Pan/zoom the infinite canvas (strokes, text, shapes, connectors, images, worksheet objects)
-- Quick ink and text on the first unlocked notes layer
-- Cell grid for spreadsheet layers; edits write A1 `input` values the desktop engine recalculates
-- Save writes pretty-printed `inkstone.notebook` version 2
+- A bottom tool bar: **Pan**, **Draw**, **Erase**, **Text**, **Cells**, **+ Page**, **+ Sheet**
+- Draw, erase, and tap-to-edit text on a notes layer (created automatically if needed)
+- Cell grid for spreadsheet layers; **+ Sheet** adds one; edits write A1 `input` values
+- **Save** writes pretty-printed `inkstone.notebook` version 2 back to the opened file
 
 It does not run GTK, VBA, charts, or the full desktop tool rail. Unknown JSON fields are kept in
 the document tree so a phone save does not strip desktop-only data.

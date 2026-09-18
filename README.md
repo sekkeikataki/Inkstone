@@ -64,9 +64,9 @@ cd android
 ```
 
 Download [`releases/inkstone-android.apk`](releases/inkstone-android.apk) and sideload it, then open
-a `.inkstone` file (try [`examples/phone-demo.inkstone`](examples/phone-demo.inkstone)). Use **Page**
-to pan/zoom, ink, or tap-add text; use **Cells** to edit a worksheet. Details are in
-[`docs/ANDROID.md`](docs/ANDROID.md).
+a `.inkstone` file (try [`examples/phone-demo.inkstone`](examples/phone-demo.inkstone)). The bottom
+bar has **Pan**, **Draw**, **Erase**, **Text**, and **Cells** so you can edit the notebook on the
+phone and **Save**. Details are in [`docs/ANDROID.md`](docs/ANDROID.md).
 
 ## Controls
 

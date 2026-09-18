@@ -32,7 +32,7 @@ import org.json.JSONObject
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-enum class EditTool { View, Ink, Text }
+enum class EditTool { Pan, Ink, Erase, Text, Cells }
 
 @Composable
 fun PageCanvas(
@@ -41,6 +41,7 @@ fun PageCanvas(
     tool: EditTool,
     revision: Int,
     onInk: (List<Triple<Float, Float, Float>>) -> Unit,
+    onErase: (x: Float, y: Float) -> Unit,
     onTextTap: (id: String?, x: Float, y: Float) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -53,11 +54,24 @@ fun PageCanvas(
         Offset((position.x - pan.x) / scale, (position.y - pan.y) / scale)
 
     val gestures = when (tool) {
-        EditTool.View -> Modifier.pointerInput(pageIndex, revision) {
+        EditTool.Pan, EditTool.Cells -> Modifier.pointerInput(pageIndex, revision) {
             detectTransformGestures { _, drag, zoom, _ ->
                 scale = (scale * zoom).coerceIn(0.2f, 8f)
                 pan += drag
             }
+        }
+        EditTool.Erase -> Modifier.pointerInput(pageIndex, revision) {
+            detectDragGestures(
+                onDragStart = { start ->
+                    val world = toWorld(start)
+                    onErase(world.x, world.y)
+                },
+                onDrag = { change, _ ->
+                    change.consume()
+                    val world = toWorld(change.position)
+                    onErase(world.x, world.y)
+                },
+            )
         }
         EditTool.Ink -> Modifier.pointerInput(pageIndex, revision) {
             detectDragGestures(

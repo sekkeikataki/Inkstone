@@ -56,6 +56,84 @@ class NotebookDoc(val root: JSONObject) {
         return null
     }
 
+    fun ensureNotesLayer(pageIndex: Int): JSONObject {
+        firstNotesLayer(pageIndex)?.let { return it }
+        val layer = JSONObject()
+            .put("id", UUID.randomUUID().toString())
+            .put("name", "Notes")
+            .put("visible", true)
+            .put("locked", false)
+            .put("elements", JSONArray())
+        layers(pageIndex).put(layer)
+        return layer
+    }
+
+    fun addPage(): Int {
+        val index = pageCount
+        pages.put(
+            JSONObject()
+                .put("id", UUID.randomUUID().toString())
+                .put("title", "Page ${index + 1}")
+                .put(
+                    "canvas",
+                    JSONObject()
+                        .put("background", rgb(0.98, 0.98, 0.97))
+                        .put("grid_spacing", 24.0)
+                        .put("grid_visible", true),
+                )
+                .put(
+                    "layers",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("id", UUID.randomUUID().toString())
+                            .put("name", "Notes")
+                            .put("visible", true)
+                            .put("locked", false)
+                            .put("elements", JSONArray()),
+                    ),
+                ),
+        )
+        return index
+    }
+
+    fun addSpreadsheetLayer(pageIndex: Int): JSONObject {
+        val layer = JSONObject()
+            .put("id", UUID.randomUUID().toString())
+            .put("name", "Spreadsheet")
+            .put("visible", true)
+            .put("locked", false)
+            .put("kind", "excel")
+            .put("elements", JSONArray())
+            .put(
+                "spreadsheet",
+                JSONObject()
+                    .put("origin", JSONObject().put("x", 48.0).put("y", 36.0))
+                    .put("active_sheet", 0)
+                    .put("sheets", JSONArray().put(newSheet("Sheet1"))),
+            )
+        layers(pageIndex).put(layer)
+        return layer
+    }
+
+    fun eraseAt(pageIndex: Int, x: Float, y: Float, radius: Float = 18f): Boolean {
+        val layers = layers(pageIndex)
+        for (i in layers.length() - 1 downTo 0) {
+            val layer = layers.getJSONObject(i)
+            if (!layer.optBoolean("visible", true) || layer.optBoolean("locked", false) || isSpreadsheet(layer)) {
+                continue
+            }
+            val elements = layer.optJSONArray("elements") ?: continue
+            for (j in elements.length() - 1 downTo 0) {
+                val element = elements.getJSONObject(j)
+                if (hitsElement(element, x, y, radius)) {
+                    elements.remove(j)
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     fun firstSpreadsheet(pageIndex: Int): Pair<JSONObject, JSONObject>? {
         val layers = layers(pageIndex)
         for (i in 0 until layers.length()) {
@@ -107,7 +185,7 @@ class NotebookDoc(val root: JSONObject) {
     }
 
     fun addText(pageIndex: Int, x: Float, y: Float, text: String): String? {
-        val layer = firstNotesLayer(pageIndex) ?: return null
+        val layer = ensureNotesLayer(pageIndex)
         val elements = layer.optJSONArray("elements") ?: JSONArray().also { layer.put("elements", it) }
         val id = UUID.randomUUID().toString()
         elements.put(
@@ -129,7 +207,7 @@ class NotebookDoc(val root: JSONObject) {
         width: Float = 2.4f,
     ): String? {
         if (points.size < 2) return null
-        val layer = firstNotesLayer(pageIndex) ?: return null
+        val layer = ensureNotesLayer(pageIndex)
         val elements = layer.optJSONArray("elements") ?: JSONArray().also { layer.put("elements", it) }
         val id = UUID.randomUUID().toString()
         val jsonPoints = JSONArray()
@@ -233,6 +311,65 @@ class NotebookDoc(val root: JSONObject) {
             include(ox + 36f + cols * 64f, oy + 26f + 22f + rows * 21f + 22f)
         }
         return Bounds(minX - 24f, minY - 24f, max(maxX - minX + 48f, 320f), max(maxY - minY + 48f, 240f))
+    }
+
+    private fun hitsElement(element: JSONObject, x: Float, y: Float, radius: Float): Boolean {
+        return when (element.optString("type")) {
+            "text" -> {
+                val origin = element.optJSONObject("origin") ?: return false
+                val ox = origin.optDouble("x").toFloat()
+                val oy = origin.optDouble("y").toFloat()
+                val size = element.optDouble("font_size", 18.0).toFloat()
+                val text = element.optString("text")
+                val width = element.optDouble("max_width", (text.length * size * 0.55).toDouble()).toFloat()
+                val height = text.lineSequence().count().coerceAtLeast(1) * size * 1.25f
+                x >= ox - radius && x <= ox + width + radius && y >= oy - size - radius && y <= oy - size + height + radius
+            }
+            "stroke" -> {
+                val points = element.optJSONArray("points") ?: return false
+                for (i in 0 until points.length() - 1) {
+                    val a = points.getJSONObject(i)
+                    val b = points.getJSONObject(i + 1)
+                    if (segmentDistance(
+                            x,
+                            y,
+                            a.optDouble("x").toFloat(),
+                            a.optDouble("y").toFloat(),
+                            b.optDouble("x").toFloat(),
+                            b.optDouble("y").toFloat(),
+                        ) <= radius
+                    ) {
+                        return true
+                    }
+                }
+                false
+            }
+            "shape", "media" -> {
+                val bounds = element.optJSONObject("bounds") ?: return false
+                val left = bounds.optDouble("x").toFloat()
+                val top = bounds.optDouble("y").toFloat()
+                x >= left - radius &&
+                    x <= left + bounds.optDouble("width").toFloat() + radius &&
+                    y >= top - radius &&
+                    y <= top + bounds.optDouble("height").toFloat() + radius
+            }
+            else -> false
+        }
+    }
+
+    private fun segmentDistance(px: Float, py: Float, ax: Float, ay: Float, bx: Float, by: Float): Float {
+        val dx = bx - ax
+        val dy = by - ay
+        val length = dx * dx + dy * dy
+        if (length < 1e-4f) {
+            val ex = px - ax
+            val ey = py - ay
+            return kotlin.math.sqrt(ex * ex + ey * ey)
+        }
+        val t = (((px - ax) * dx + (py - ay) * dy) / length).coerceIn(0f, 1f)
+        val ex = px - (ax + dx * t)
+        val ey = py - (ay + dy * t)
+        return kotlin.math.sqrt(ex * ex + ey * ey)
     }
 
     private fun growVisible(sheet: JSONObject, address: String) {

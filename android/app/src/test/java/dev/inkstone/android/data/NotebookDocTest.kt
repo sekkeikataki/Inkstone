@@ -83,4 +83,19 @@ class NotebookDocTest {
         assertEquals("Old note", notebook.title)
         assertEquals(1, notebook.pageCount)
     }
+
+    @Test
+    fun phoneToolsCanAddPageSheetInkAndErase() {
+        val notebook = NotebookDoc.blank()
+        val page = notebook.addPage()
+        assertEquals(2, notebook.pageCount)
+        notebook.addSpreadsheetLayer(page)
+        notebook.setCell(page, "A1", "hello")
+        assertEquals("hello", notebook.cellInput(notebook.activeSheet(notebook.firstSpreadsheet(page)!!.second), "A1"))
+        notebook.addStroke(page, listOf(Triple(8f, 8f, 1f), Triple(12f, 9f, 1f)))
+        notebook.addText(page, 40f, 40f, "note")
+        assertEquals(2, notebook.firstNotesLayer(page)!!.getJSONArray("elements").length())
+        assertTrue(notebook.eraseAt(page, 10f, 8.5f))
+        assertEquals(1, notebook.firstNotesLayer(page)!!.getJSONArray("elements").length())
+    }
 }
