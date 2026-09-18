@@ -3,6 +3,9 @@ use crate::document::{
     Shape, ShapeKind, Stroke, StrokeKind, StrokePoint, StrokeStyle, TextNote,
 };
 use crate::notebook::{Asset, Layer, Notebook, NotebookPage, SearchHit};
+use crate::spreadsheet::address::{CellAddr, CellRange, col_name};
+use crate::spreadsheet::formula::Value;
+use crate::spreadsheet::{HAlign, LayerKind, Spreadsheet};
 use base64::Engine;
 use cairo::PdfSurface;
 use gdk_pixbuf::{Pixbuf, PixbufLoader};
@@ -80,6 +83,9 @@ struct CanvasState {
     page_fade: Option<Instant>,
     empty_hint: Option<Instant>,
     fx_generation: u64,
+    sheet_range: Option<CellRange>,
+    sheet_editing: Option<(CellAddr, String)>,
+    sheet_listeners: Vec<Rc<dyn Fn()>>,
 }
 
 enum Interaction {
@@ -104,6 +110,14 @@ enum Interaction {
         last_screen: Point,
     },
     Erase,
+    SheetSelect {
+        start: CellAddr,
+        current: CellAddr,
+    },
+    SheetMove {
+        last_world: Point,
+        origin_before: Point,
+    },
 }
 
 enum HistoryEntry {
@@ -134,6 +148,11 @@ enum HistoryEntry {
         page_id: Uuid,
         index: usize,
         stored: Option<Layer>,
+    },
+    SpreadsheetChanged {
+        page_id: Uuid,
+        layer_id: Uuid,
+        stored: Option<Spreadsheet>,
     },
 }
 
@@ -176,6 +195,9 @@ impl Default for CanvasState {
             page_fade: None,
             empty_hint: Some(Instant::now()),
             fx_generation: 0,
+            sheet_range: Some(CellRange::single(CellAddr { col: 0, row: 0 })),
+            sheet_editing: None,
+            sheet_listeners: Vec::new(),
         }
     }
 }
@@ -201,6 +223,7 @@ impl Canvas {
         attach_pointer_input(&area, &state);
         attach_stylus_input(&area, &state);
         attach_view_controls(&area, &state);
+        attach_keyboard_input(&area, &state);
         area.connect_realize({
             let state = state.clone();
             move |area| {
@@ -208,6 +231,8 @@ impl Canvas {
                     let mut state = state.borrow_mut();
                     if state.page().visible_elements().next().is_none() {
                         state.empty_hint = Some(Instant::now());
+                        state.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+                        state.sheet_editing = None;
                     }
                 }
                 start_canvas_fx(area, &state);
@@ -273,9 +298,12 @@ impl Canvas {
         state.redo.clear();
         state.selection.clear();
         state.image_cache.clear();
+        state.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+        state.sheet_editing = None;
         state.begin_page_fade();
         drop(state);
         self.emit_view_changed();
+        self.emit_sheet_changed();
         start_canvas_fx(&self.area, &self.state);
         self.area.queue_draw();
     }
@@ -293,9 +321,12 @@ impl Canvas {
         state.dirty = false;
         state.selection.clear();
         state.rebuild_image_cache();
+        state.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+        state.sheet_editing = None;
         state.begin_page_fade();
         drop(state);
         self.emit_view_changed();
+        self.emit_sheet_changed();
         start_canvas_fx(&self.area, &self.state);
         self.area.queue_draw();
         Ok(())
@@ -347,8 +378,13 @@ impl Canvas {
                     24.0 - bounds.y as f64 * scale,
                 );
                 context.scale(scale, scale);
-                for element in page.visible_elements() {
-                    draw_element(&context, element, &state.image_cache);
+                for layer in page.layers.iter().filter(|layer| layer.visible) {
+                    if let Some(spreadsheet) = &layer.spreadsheet {
+                        draw_spreadsheet(&context, &state, spreadsheet, layer.id, bounds);
+                    }
+                    for element in &layer.elements {
+                        draw_element(&context, element, &state.image_cache);
+                    }
                 }
                 context.restore().ok();
             }
@@ -374,7 +410,20 @@ impl Canvas {
     }
 
     pub fn element_count(&self) -> usize {
-        self.state.borrow().page().elements().count()
+        let state = self.state.borrow();
+        state.page().elements().count()
+            + state
+                .page()
+                .layers
+                .iter()
+                .filter_map(|layer| layer.spreadsheet.as_ref())
+                .map(|book| {
+                    book.sheets
+                        .iter()
+                        .map(|sheet| sheet.cells.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -384,12 +433,14 @@ impl Canvas {
     pub fn undo(&self) {
         self.state.borrow_mut().undo();
         self.schedule_autosave();
+        self.emit_sheet_changed();
         self.area.queue_draw();
     }
 
     pub fn redo(&self) {
         self.state.borrow_mut().redo();
         self.schedule_autosave();
+        self.emit_sheet_changed();
         self.area.queue_draw();
     }
 
@@ -399,17 +450,30 @@ impl Canvas {
             .notebook
             .pages
             .iter()
-            .map(|page| page.elements().count())
+            .map(|page| {
+                page.elements().count()
+                    + page
+                        .layers
+                        .iter()
+                        .filter_map(|layer| layer.spreadsheet.as_ref())
+                        .map(|book| {
+                            book.sheets
+                                .iter()
+                                .map(|sheet| sheet.cells.len())
+                                .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
             .collect()
     }
 
-    pub fn layer_summaries(&self) -> Vec<(String, bool, bool)> {
+    pub fn layer_summaries(&self) -> Vec<(String, bool, bool, LayerKind)> {
         self.state
             .borrow()
             .page()
             .layers
             .iter()
-            .map(|layer| (layer.name.clone(), layer.visible, layer.locked))
+            .map(|layer| (layer.name.clone(), layer.visible, layer.locked, layer.kind))
             .collect()
     }
 
@@ -483,9 +547,11 @@ impl Canvas {
         state.selection.clear();
         state.search_position = 0;
         state.begin_page_fade();
+        state.reset_sheet_focus();
         drop(state);
         start_canvas_fx(&self.area, &self.state);
         self.reset_view();
+        self.emit_sheet_changed();
     }
 
     pub fn add_page(&self) {
@@ -498,10 +564,12 @@ impl Canvas {
         state.push_history(HistoryEntry::PageAdded { id, stored: None });
         state.dirty = true;
         state.begin_page_fade();
+        state.reset_sheet_focus();
         drop(state);
         self.schedule_autosave();
         start_canvas_fx(&self.area, &self.state);
         self.reset_view();
+        self.emit_sheet_changed();
     }
 
     pub fn remove_active_page(&self) -> bool {
@@ -520,10 +588,12 @@ impl Canvas {
         state.selection.clear();
         state.dirty = true;
         state.begin_page_fade();
+        state.reset_sheet_focus();
         drop(state);
         self.schedule_autosave();
         start_canvas_fx(&self.area, &self.state);
         self.reset_view();
+        self.emit_sheet_changed();
         true
     }
 
@@ -553,8 +623,230 @@ impl Canvas {
         self.state.borrow().active_layer().visible
     }
 
+    pub fn active_layer_kind(&self) -> LayerKind {
+        self.state.borrow().active_layer().kind
+    }
+
     pub fn active_layer_locked(&self) -> bool {
         self.state.borrow().active_layer().locked
+    }
+
+    pub fn add_spreadsheet_layer(&self) {
+        let mut state = self.state.borrow_mut();
+        let page_id = state.page().id;
+        let layer = Layer::spreadsheet(format!(
+            "Spreadsheet {}",
+            state
+                .page()
+                .layers
+                .iter()
+                .filter(|layer| layer.is_spreadsheet())
+                .count()
+                + 1
+        ));
+        let id = layer.id;
+        state.page_mut().layers.push(layer);
+        state.active_layer = state.page().layers.len() - 1;
+        state.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+        state.sheet_editing = None;
+        state.push_history(HistoryEntry::LayerAdded {
+            page_id,
+            id,
+            stored: None,
+        });
+        state.dirty = true;
+        drop(state);
+        self.schedule_autosave();
+        self.emit_sheet_changed();
+        self.area.queue_draw();
+    }
+
+    pub fn add_workbook_sheet(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_spreadsheet() || state.active_layer().locked {
+            return;
+        }
+        let Some(before) = state.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(spreadsheet) = state.active_layer_mut().spreadsheet.as_mut() {
+            spreadsheet.add_sheet();
+        }
+        state.push_spreadsheet_history(before);
+        state.dirty = true;
+        drop(state);
+        self.schedule_autosave();
+        self.emit_sheet_changed();
+        self.area.queue_draw();
+    }
+
+    pub fn sheet_formula(&self) -> String {
+        let state = self.state.borrow();
+        if let Some((_, buffer)) = &state.sheet_editing {
+            return buffer.clone();
+        }
+        let Some(addr) = state.sheet_range.map(|range| range.start) else {
+            return String::new();
+        };
+        state
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .and_then(|book| book.active().cells.get(&addr))
+            .map(|cell| cell.input.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn sheet_address(&self) -> String {
+        self.state
+            .borrow()
+            .sheet_range
+            .map(|range| {
+                if range.start == range.end {
+                    range.start.a1()
+                } else {
+                    range.a1()
+                }
+            })
+            .unwrap_or_else(|| "A1".to_owned())
+    }
+
+    pub fn sheet_value(&self) -> String {
+        let state = self.state.borrow();
+        let Some(addr) = state.sheet_range.map(|range| range.start) else {
+            return String::new();
+        };
+        state
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .map(|book| book.display_cell(book.active_sheet, addr))
+            .unwrap_or_default()
+    }
+
+    pub fn set_sheet_formula(&self, text: String) {
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_spreadsheet() || state.active_layer().locked {
+            return;
+        }
+        let addr = state
+            .sheet_range
+            .map(|range| range.start)
+            .unwrap_or(CellAddr { col: 0, row: 0 });
+        state.sheet_editing = Some((addr, text));
+        drop(state);
+        self.area.queue_draw();
+    }
+
+    pub fn commit_sheet_formula(&self) {
+        self.state.borrow_mut().commit_sheet_edit();
+        self.schedule_autosave();
+        self.emit_sheet_changed();
+        self.area.queue_draw();
+    }
+
+    pub fn toggle_sheet_bold(&self) {
+        self.mutate_selected_cells(|cell| cell.style.bold = !cell.style.bold);
+    }
+
+    pub fn cycle_sheet_align(&self) {
+        self.mutate_selected_cells(|cell| {
+            cell.style.h_align = match cell.style.h_align {
+                HAlign::General | HAlign::Left => HAlign::Center,
+                HAlign::Center => HAlign::Right,
+                HAlign::Right => HAlign::General,
+            };
+        });
+    }
+
+    pub fn goto_sheet_address(&self, text: &str) -> bool {
+        let Some(range) = CellRange::parse(text) else {
+            return false;
+        };
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_spreadsheet() {
+            return false;
+        }
+        state.commit_sheet_edit();
+        state.sheet_range = Some(range);
+        drop(state);
+        self.emit_sheet_changed();
+        self.area.queue_draw();
+        true
+    }
+
+    pub fn fill_sheet_selection(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_spreadsheet() || state.active_layer().locked {
+            return;
+        }
+        let Some(range) = state.sheet_range else {
+            return;
+        };
+        if range.start == range.end {
+            return;
+        }
+        let source = if range.rows() > 1 {
+            CellRange::new(
+                range.start,
+                CellAddr {
+                    col: range.end.col,
+                    row: range.start.row,
+                },
+            )
+        } else {
+            CellRange::single(range.start)
+        };
+        let Some(before) = state.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = state.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().fill(source, range);
+        }
+        state.push_spreadsheet_history(before);
+        state.dirty = true;
+        drop(state);
+        self.schedule_autosave();
+        self.emit_sheet_changed();
+        self.area.queue_draw();
+    }
+
+    pub fn fill_sheet_color(&self, color: Color) {
+        self.mutate_selected_cells(|cell| cell.style.fill = Some(color));
+    }
+
+    fn mutate_selected_cells(&self, mutator: impl Fn(&mut crate::spreadsheet::Cell)) {
+        let mut state = self.state.borrow_mut();
+        if state.active_layer().locked || !state.active_layer().is_spreadsheet() {
+            return;
+        }
+        let Some(range) = state.sheet_range else {
+            return;
+        };
+        let Some(before) = state.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(sheet) = state.active_layer_mut().spreadsheet.as_mut() {
+            for addr in range.cells() {
+                mutator(sheet.active_mut().cells.entry(addr).or_default());
+            }
+        }
+        state.push_spreadsheet_history(before);
+        state.dirty = true;
+        drop(state);
+        self.schedule_autosave();
+        self.area.queue_draw();
+    }
+
+    pub fn connect_sheet_changed(&self, callback: impl Fn() + 'static) {
+        self.state
+            .borrow_mut()
+            .sheet_listeners
+            .push(Rc::new(callback));
+    }
+
+    fn emit_sheet_changed(&self) {
+        emit_sheet_changed(&self.state);
     }
 
     pub fn grid_visible(&self) -> bool {
@@ -564,10 +856,16 @@ impl Canvas {
     pub fn set_active_layer(&self, index: usize) {
         let mut state = self.state.borrow_mut();
         if index < state.page().layers.len() {
+            state.commit_sheet_edit();
             state.active_layer = index;
             state.selection.clear();
+            if state.active_layer().is_spreadsheet() {
+                state.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+            }
+            state.sheet_editing = None;
         }
         drop(state);
+        self.emit_sheet_changed();
         self.area.queue_draw();
     }
 
@@ -584,8 +882,10 @@ impl Canvas {
             stored: None,
         });
         state.dirty = true;
+        state.reset_sheet_focus();
         drop(state);
         self.schedule_autosave();
+        self.emit_sheet_changed();
         self.area.queue_draw();
     }
 
@@ -605,8 +905,10 @@ impl Canvas {
         state.active_layer = index.min(state.page().layers.len() - 1);
         state.selection.clear();
         state.dirty = true;
+        state.reset_sheet_focus();
         drop(state);
         self.schedule_autosave();
+        self.emit_sheet_changed();
         self.area.queue_draw();
         true
     }
@@ -641,6 +943,7 @@ impl Canvas {
         drop(state);
         if count > 0 {
             self.schedule_autosave();
+            self.emit_sheet_changed();
             self.area.queue_draw();
         }
         count
@@ -679,25 +982,37 @@ impl Canvas {
             .position(|layer| layer.id == hit.layer_id)
             .unwrap_or(0);
         state.selection.clear();
-        state.selection.insert(hit.element_id);
-        state.flash_selection();
-        state.begin_page_fade();
-        let target_bounds = {
-            state
-                .page()
-                .elements()
-                .find(|element| element.id() == hit.element_id)
-                .map(Element::bounds)
-        };
-        if let Some(bounds) = target_bounds {
-            let center = bounds.center();
-            state.pan = Point::new(
-                self.area.width() as f32 / 2.0 - center.x * state.zoom,
-                self.area.height() as f32 / 2.0 - center.y * state.zoom,
-            );
+        if let Some(cell) = hit.cell.as_deref().and_then(CellAddr::parse_a1) {
+            state.sheet_range = Some(CellRange::single(cell));
+            if let Some(book) = state.active_layer().spreadsheet.as_ref() {
+                let center = book.cell_rect(cell).center();
+                state.pan = Point::new(
+                    self.area.width() as f32 / 2.0 - center.x * state.zoom,
+                    self.area.height() as f32 / 2.0 - center.y * state.zoom,
+                );
+            }
+        } else {
+            state.selection.insert(hit.element_id);
+            state.flash_selection();
+            state.begin_page_fade();
+            let target_bounds = {
+                state
+                    .page()
+                    .elements()
+                    .find(|element| element.id() == hit.element_id)
+                    .map(Element::bounds)
+            };
+            if let Some(bounds) = target_bounds {
+                let center = bounds.center();
+                state.pan = Point::new(
+                    self.area.width() as f32 / 2.0 - center.x * state.zoom,
+                    self.area.height() as f32 / 2.0 - center.y * state.zoom,
+                );
+            }
         }
         drop(state);
         start_canvas_fx(&self.area, &self.state);
+        self.emit_sheet_changed();
         self.area.queue_draw();
         Some(hit)
     }
@@ -728,6 +1043,11 @@ impl Canvas {
             }
         };
         let bytes = fs::read(path)?;
+        if self.state.borrow().active_layer().is_spreadsheet() {
+            return Err(DocumentError::Invalid(
+                "import images onto a notes layer; spreadsheet layers hold workbooks".to_owned(),
+            ));
+        }
         let asset_id = Uuid::new_v4();
         let name = path
             .file_name()
@@ -899,7 +1219,13 @@ impl CanvasState {
 
     fn begin_page_fade(&mut self) {
         self.page_fade = Some(Instant::now());
-        if self.page().visible_elements().next().is_none() {
+        if self.page().visible_elements().next().is_none()
+            && !self
+                .page()
+                .layers
+                .iter()
+                .any(|layer| layer.visible && layer.spreadsheet.is_some())
+        {
             self.empty_hint = Some(Instant::now());
         }
     }
@@ -920,6 +1246,223 @@ impl CanvasState {
         let page = self.active_page;
         let layer = self.active_layer;
         &mut self.notebook.pages[page].layers[layer]
+    }
+
+    fn reset_sheet_focus(&mut self) {
+        self.sheet_editing = None;
+        if self.active_layer().is_spreadsheet() {
+            self.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+        }
+    }
+
+    fn capture_spreadsheet(&self) -> Option<(Uuid, Uuid, Spreadsheet)> {
+        let layer = self.active_layer();
+        Some((self.page().id, layer.id, layer.spreadsheet.clone()?))
+    }
+
+    fn push_spreadsheet_history(&mut self, (page_id, layer_id, stored): (Uuid, Uuid, Spreadsheet)) {
+        self.push_history(HistoryEntry::SpreadsheetChanged {
+            page_id,
+            layer_id,
+            stored: Some(stored),
+        });
+    }
+
+    fn commit_sheet_edit(&mut self) {
+        let Some((addr, input)) = self.sheet_editing.take() else {
+            return;
+        };
+        if self.active_layer().locked || !self.active_layer().is_spreadsheet() {
+            return;
+        }
+        let current = self
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .and_then(|book| book.active().cells.get(&addr))
+            .map(|cell| cell.input.clone())
+            .unwrap_or_default();
+        if current == input {
+            return;
+        }
+        let Some(before) = self.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().set_input(addr, input);
+        }
+        self.push_spreadsheet_history(before);
+        self.dirty = true;
+    }
+
+    fn clear_sheet_selection(&mut self) -> usize {
+        self.commit_sheet_edit();
+        if self.active_layer().locked {
+            return 0;
+        }
+        let Some(range) = self.sheet_range else {
+            return 0;
+        };
+        let Some(before) = self.capture_spreadsheet() else {
+            return 0;
+        };
+        let Some(book) = self.active_layer_mut().spreadsheet.as_mut() else {
+            return 0;
+        };
+        let count = range.cells().count();
+        book.active_mut().clear_range(range);
+        self.push_spreadsheet_history(before);
+        self.dirty = true;
+        count
+    }
+
+    fn handle_sheet_key(&mut self, key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+        if !self.active_layer().is_spreadsheet() {
+            return false;
+        }
+        let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        if self.active_layer().locked && !matches!(key, gtk::gdk::Key::Escape) {
+            return false;
+        }
+        if key == gtk::gdk::Key::Escape {
+            self.sheet_editing = None;
+            return true;
+        }
+        if key == gtk::gdk::Key::F2 {
+            let addr = self
+                .sheet_range
+                .map(|range| range.start)
+                .unwrap_or(CellAddr { col: 0, row: 0 });
+            let current = self
+                .active_layer()
+                .spreadsheet
+                .as_ref()
+                .and_then(|book| book.active().cells.get(&addr))
+                .map(|cell| cell.input.clone())
+                .unwrap_or_default();
+            self.sheet_editing = Some((addr, current));
+            return true;
+        }
+        if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+            self.commit_sheet_edit();
+            self.move_sheet_selection(0, 1, shift);
+            return true;
+        }
+        if key == gtk::gdk::Key::Tab {
+            self.commit_sheet_edit();
+            self.move_sheet_selection(1, 0, shift);
+            return true;
+        }
+        if self.sheet_editing.is_none() {
+            if key == gtk::gdk::Key::Left {
+                self.move_sheet_selection(-1, 0, shift);
+                return true;
+            }
+            if key == gtk::gdk::Key::Right {
+                self.move_sheet_selection(1, 0, shift);
+                return true;
+            }
+            if key == gtk::gdk::Key::Up {
+                self.move_sheet_selection(0, -1, shift);
+                return true;
+            }
+            if key == gtk::gdk::Key::Down {
+                self.move_sheet_selection(0, 1, shift);
+                return true;
+            }
+            if key == gtk::gdk::Key::Delete || key == gtk::gdk::Key::BackSpace {
+                self.clear_sheet_selection();
+                return true;
+            }
+            if ctrl && key == gtk::gdk::Key::b {
+                if let Some(range) = self.sheet_range
+                    && let Some(before) = self.capture_spreadsheet()
+                {
+                    if let Some(sheet) = self.active_layer_mut().spreadsheet.as_mut() {
+                        for addr in range.cells() {
+                            let cell = sheet.active_mut().cells.entry(addr).or_default();
+                            cell.style.bold = !cell.style.bold;
+                        }
+                    }
+                    self.push_spreadsheet_history(before);
+                    self.dirty = true;
+                }
+                return true;
+            }
+            if let Some(ch) = key.to_unicode()
+                && !ctrl
+                && !ch.is_control()
+            {
+                let addr = self
+                    .sheet_range
+                    .map(|range| range.start)
+                    .unwrap_or(CellAddr { col: 0, row: 0 });
+                self.sheet_editing = Some((addr, ch.to_string()));
+                return true;
+            }
+            return false;
+        }
+        if let Some((_, buffer)) = self.sheet_editing.as_mut() {
+            if key == gtk::gdk::Key::BackSpace {
+                buffer.pop();
+                return true;
+            }
+            if let Some(ch) = key.to_unicode()
+                && !ctrl
+                && !ch.is_control()
+            {
+                buffer.push(ch);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn move_sheet_selection(&mut self, dcol: i32, drow: i32, extend: bool) {
+        let Some(range) = self.sheet_range else {
+            self.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+            return;
+        };
+        let Some(next) = range.end.offset(dcol, drow) else {
+            return;
+        };
+        self.sheet_range = Some(if extend {
+            CellRange::new(range.start, next)
+        } else {
+            CellRange::single(next)
+        });
+    }
+
+    fn begin_sheet_pointer(&mut self, world: Point) {
+        self.commit_sheet_edit();
+        let Some(book) = self.active_layer().spreadsheet.clone() else {
+            return;
+        };
+        if let Some(index) = book.hit_tab(world) {
+            if let Some(before) = self.capture_spreadsheet() {
+                if let Some(spreadsheet) = self.active_layer_mut().spreadsheet.as_mut() {
+                    spreadsheet.active_sheet = index;
+                }
+                self.push_spreadsheet_history(before);
+                self.dirty = true;
+            }
+            return;
+        }
+        if book.hit_title(world) {
+            self.interaction = Some(Interaction::SheetMove {
+                last_world: world,
+                origin_before: book.origin,
+            });
+            return;
+        }
+        if let Some(addr) = book.hit_cell(world) {
+            self.sheet_range = Some(CellRange::single(addr));
+            self.interaction = Some(Interaction::SheetSelect {
+                start: addr,
+                current: addr,
+            });
+        }
     }
 
     fn rebuild_image_cache(&mut self) {
@@ -1016,6 +1559,9 @@ impl CanvasState {
     }
 
     fn delete_selection(&mut self) -> usize {
+        if self.active_layer().is_spreadsheet() {
+            return self.clear_sheet_selection();
+        }
         if self.selection.is_empty() {
             return 0;
         }
@@ -1158,6 +1704,16 @@ impl CanvasState {
         }
 
         let world = self.screen_to_world(screen);
+        if self.active_layer().is_spreadsheet()
+            && button != 2
+            && self.tool != Tool::Pan
+            && !eraser_tip
+        {
+            if !self.active_layer().locked {
+                self.begin_sheet_pointer(world);
+            }
+            return;
+        }
         let effective_tool = if eraser_tip { Tool::Eraser } else { self.tool };
         match effective_tool {
             Tool::Select => {
@@ -1246,7 +1802,13 @@ impl CanvasState {
     fn update_input(&mut self, screen: Point, pressure: f32) {
         let world = self.screen_to_world(screen);
         let zoom = self.zoom;
+        let sheet_hit = self
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .and_then(|book| book.hit_cell(world));
         let mut selection_delta = None;
+        let mut sheet_delta = None;
         match self.interaction.as_mut() {
             Some(Interaction::Stroke(stroke)) => {
                 let should_add = stroke
@@ -1273,11 +1835,26 @@ impl CanvasState {
                 self.pan.y += screen.y - last_screen.y;
                 *last_screen = screen;
             }
+            Some(Interaction::SheetSelect { current, .. }) => {
+                if let Some(addr) = sheet_hit {
+                    *current = addr;
+                }
+            }
+            Some(Interaction::SheetMove { last_world, .. }) => {
+                sheet_delta = Some(Point::new(world.x - last_world.x, world.y - last_world.y));
+                *last_world = world;
+            }
             Some(Interaction::Erase) => self.erase_at(world),
             None => {}
         }
         if let Some(delta) = selection_delta {
             self.translate_selection(delta);
+        }
+        if let Some(delta) = sheet_delta
+            && let Some(book) = self.active_layer_mut().spreadsheet.as_mut()
+        {
+            book.origin.x += delta.x;
+            book.origin.y += delta.y;
         }
     }
 
@@ -1360,10 +1937,30 @@ impl CanvasState {
                 }
             }
             Interaction::Pan { .. } | Interaction::Erase => {}
+            Interaction::SheetSelect { start, current } => {
+                self.sheet_range = Some(CellRange::new(start, current));
+            }
+            Interaction::SheetMove { origin_before, .. } => {
+                let current = self
+                    .active_layer()
+                    .spreadsheet
+                    .as_ref()
+                    .map(|book| book.origin);
+                if current.is_some_and(|origin| origin != origin_before)
+                    && let Some(mut before) = self.capture_spreadsheet()
+                {
+                    before.2.origin = origin_before;
+                    self.push_spreadsheet_history(before);
+                    self.dirty = true;
+                }
+            }
         }
     }
 
     fn add_element(&mut self, element: Element) {
+        if self.active_layer().is_spreadsheet() {
+            return;
+        }
         let id = element.id();
         let page_id = self.page().id;
         let layer_id = self.active_layer().id;
@@ -1507,8 +2104,34 @@ impl CanvasState {
                 }
                 self.active_layer = (*index).min(page.layers.len() - 1);
             }
+            HistoryEntry::SpreadsheetChanged {
+                page_id,
+                layer_id,
+                stored,
+            } => {
+                let Some(page) = self
+                    .notebook
+                    .pages
+                    .iter_mut()
+                    .find(|page| page.id == *page_id)
+                else {
+                    return;
+                };
+                let Some(layer) = page.layers.iter_mut().find(|layer| layer.id == *layer_id) else {
+                    return;
+                };
+                std::mem::swap(&mut layer.spreadsheet, stored);
+            }
         }
         self.selection.clear();
+        self.sheet_editing = None;
+    }
+}
+
+fn emit_sheet_changed(state: &Rc<RefCell<CanvasState>>) {
+    let listeners = state.borrow().sheet_listeners.clone();
+    for listener in listeners {
+        listener();
     }
 }
 
@@ -1679,6 +2302,7 @@ fn attach_pointer_input(area: &gtk::DrawingArea, state: &Rc<RefCell<CanvasState>
             );
             schedule_autosave(&state);
             emit_busy(&state);
+            emit_sheet_changed(&state);
             start_canvas_fx(&area, &state);
             area.queue_draw();
         }
@@ -1729,6 +2353,7 @@ fn attach_stylus_input(area: &gtk::DrawingArea, state: &Rc<RefCell<CanvasState>>
             drop(state);
             schedule_autosave(&state_ref);
             emit_busy(&state_ref);
+            emit_sheet_changed(&state_ref);
             start_canvas_fx(&area, &state_ref);
             area.queue_draw();
         }
@@ -1812,6 +2437,26 @@ fn attach_view_controls(area: &gtk::DrawingArea, state: &Rc<RefCell<CanvasState>
     area.add_controller(pinch);
 }
 
+fn attach_keyboard_input(area: &gtk::DrawingArea, state: &Rc<RefCell<CanvasState>>) {
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let state = state.clone();
+        let area = area.clone();
+        move |_, key, _, modifiers| {
+            let handled = state.borrow_mut().handle_sheet_key(key, modifiers);
+            if handled {
+                schedule_autosave(&state);
+                emit_sheet_changed(&state);
+                area.queue_draw();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    area.add_controller(keys);
+}
+
 fn draw_canvas(context: &Context, width: i32, height: i32, state: &CanvasState) {
     set_source(context, state.page().canvas.background);
     let _ = context.paint();
@@ -1830,12 +2475,17 @@ fn draw_canvas(context: &Context, width: i32, height: i32, state: &CanvasState) 
         draw_grid(context, state, viewport);
     }
 
-    for element in state.page().visible_elements() {
-        if element
-            .bounds()
-            .intersects(viewport.expand(48.0 / state.zoom))
-        {
-            draw_element(context, element, &state.image_cache);
+    for layer in state.page().layers.iter().filter(|layer| layer.visible) {
+        if let Some(spreadsheet) = &layer.spreadsheet {
+            draw_spreadsheet(context, state, spreadsheet, layer.id, viewport);
+        }
+        for element in &layer.elements {
+            if element
+                .bounds()
+                .intersects(viewport.expand(48.0 / state.zoom))
+            {
+                draw_element(context, element, &state.image_cache);
+            }
         }
     }
     draw_selection(context, state);
@@ -1888,6 +2538,225 @@ fn stroke_grid_lines(
     let _ = context.stroke();
 }
 
+fn draw_spreadsheet(
+    context: &Context,
+    state: &CanvasState,
+    book: &Spreadsheet,
+    layer_id: Uuid,
+    viewport: Rect,
+) {
+    let bounds = book.bounds();
+    if !bounds.intersects(viewport.expand(24.0)) {
+        return;
+    }
+    let sheet = book.active();
+    let active = state.active_layer().id == layer_id;
+    context.set_source_rgb(1.0, 1.0, 1.0);
+    context.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        bounds.height as f64,
+    );
+    let _ = context.fill();
+    context.set_source_rgb(0.18, 0.42, 0.28);
+    context.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        crate::spreadsheet::TITLE_HEIGHT as f64,
+    );
+    let _ = context.fill();
+    context.set_source_rgb(1.0, 1.0, 1.0);
+    context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    context.set_font_size(12.0);
+    context.move_to((bounds.x + 10.0) as f64, (bounds.y + 17.0) as f64);
+    let _ = context.show_text(&format!(
+        "{} · {}",
+        sheet.name,
+        if active { "editing" } else { "spreadsheet" }
+    ));
+
+    let cols = sheet.display_cols().min(48);
+    let rows = sheet.display_rows().min(80);
+    let header_top = bounds.y + crate::spreadsheet::TITLE_HEIGHT;
+    context.set_font_size(10.0);
+    context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+    let mut x = bounds.x + crate::spreadsheet::HEADER_COL_WIDTH;
+    for col in 0..cols {
+        let width = sheet.col_width(col);
+        context.set_source_rgb(0.91, 0.93, 0.91);
+        context.rectangle(
+            x as f64,
+            header_top as f64,
+            width as f64,
+            crate::spreadsheet::HEADER_ROW_HEIGHT as f64,
+        );
+        let _ = context.fill();
+        context.set_source_rgb(0.28, 0.32, 0.28);
+        context.move_to((x + 6.0) as f64, (header_top + 15.0) as f64);
+        let _ = context.show_text(&col_name(col));
+        x += width;
+    }
+    let mut y = header_top + crate::spreadsheet::HEADER_ROW_HEIGHT;
+    for row in 0..rows {
+        let height = sheet.row_height(row);
+        context.set_source_rgb(0.91, 0.93, 0.91);
+        context.rectangle(
+            bounds.x as f64,
+            y as f64,
+            crate::spreadsheet::HEADER_COL_WIDTH as f64,
+            height as f64,
+        );
+        let _ = context.fill();
+        context.set_source_rgb(0.28, 0.32, 0.28);
+        context.move_to((bounds.x + 8.0) as f64, (y + height * 0.7) as f64);
+        let _ = context.show_text(&(row + 1).to_string());
+        y += height;
+    }
+
+    let selected = if active { state.sheet_range } else { None };
+    for col in 0..cols {
+        for row in 0..rows {
+            let addr = CellAddr { col, row };
+            let rect = book.cell_rect(addr);
+            if !rect.intersects(viewport.expand(8.0)) {
+                continue;
+            }
+            let cell = sheet.cells.get(&addr);
+            if let Some(fill) = cell.and_then(|cell| cell.style.fill) {
+                set_source(context, fill);
+                context.rectangle(
+                    rect.x as f64,
+                    rect.y as f64,
+                    rect.width as f64,
+                    rect.height as f64,
+                );
+                let _ = context.fill();
+            }
+            context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
+            context.set_line_width(0.6 / state.zoom as f64);
+            context.rectangle(
+                rect.x as f64,
+                rect.y as f64,
+                rect.width as f64,
+                rect.height as f64,
+            );
+            let _ = context.stroke();
+            let editing = state
+                .sheet_editing
+                .as_ref()
+                .filter(|(edit_addr, _)| active && *edit_addr == addr);
+            let text = if let Some((_, buffer)) = editing {
+                buffer.clone()
+            } else {
+                book.display_cell(book.active_sheet, addr)
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let style = cell.map(|cell| &cell.style);
+            context.select_font_face(
+                "Sans",
+                if style.is_some_and(|style| style.italic) {
+                    cairo::FontSlant::Italic
+                } else {
+                    cairo::FontSlant::Normal
+                },
+                if style.is_some_and(|style| style.bold) {
+                    cairo::FontWeight::Bold
+                } else {
+                    cairo::FontWeight::Normal
+                },
+            );
+            context.set_font_size(
+                style
+                    .map(|style| style.font_size_or_default())
+                    .unwrap_or(11.0) as f64,
+            );
+            set_source(
+                context,
+                style.map(|style| style.text_color()).unwrap_or(Color::INK),
+            );
+            let align = style.map(|style| style.h_align).unwrap_or(HAlign::General);
+            let value = book.evaluate(book.active_sheet, addr);
+            let numeric = matches!(value, Value::Number(_) | Value::Bool(_));
+            let _ = context.save();
+            context.rectangle(
+                rect.x as f64,
+                rect.y as f64,
+                rect.width as f64,
+                rect.height as f64,
+            );
+            context.clip();
+            let width = context
+                .text_extents(&text)
+                .map(|ext| ext.width())
+                .unwrap_or(0.0);
+            let text_x = match align {
+                HAlign::Center => rect.x as f64 + rect.width as f64 / 2.0 - width / 2.0,
+                HAlign::Right => rect.x as f64 + rect.width as f64 - 5.0 - width,
+                HAlign::General if numeric && editing.is_none() => {
+                    rect.x as f64 + rect.width as f64 - 5.0 - width
+                }
+                _ => rect.x as f64 + 4.0,
+            };
+            context.move_to(text_x, (rect.y + rect.height * 0.72) as f64);
+            let _ = context.show_text(&text);
+            let _ = context.restore();
+        }
+    }
+
+    if let Some(range) = selected {
+        let a = book.cell_rect(range.start);
+        let b = book.cell_rect(range.end);
+        let highlight = a.union(b);
+        context.set_source_rgba(0.12, 0.46, 0.28, 0.14);
+        context.rectangle(
+            highlight.x as f64,
+            highlight.y as f64,
+            highlight.width as f64,
+            highlight.height as f64,
+        );
+        let _ = context.fill();
+        context.set_source_rgb(0.12, 0.46, 0.28);
+        context.set_line_width(1.8 / state.zoom as f64);
+        context.rectangle(
+            highlight.x as f64,
+            highlight.y as f64,
+            highlight.width as f64,
+            highlight.height as f64,
+        );
+        let _ = context.stroke();
+    }
+
+    let tab_top = bounds.y + bounds.height - crate::spreadsheet::TAB_HEIGHT;
+    context.set_source_rgb(0.94, 0.95, 0.94);
+    context.rectangle(
+        bounds.x as f64,
+        tab_top as f64,
+        bounds.width as f64,
+        crate::spreadsheet::TAB_HEIGHT as f64,
+    );
+    let _ = context.fill();
+    let mut tab_x = bounds.x + 8.0;
+    context.set_font_size(10.0);
+    for (index, tab) in book.sheets.iter().enumerate() {
+        let width = (tab.name.len() as f32 * 7.5 + 18.0).max(48.0);
+        if index == book.active_sheet {
+            context.set_source_rgb(1.0, 1.0, 1.0);
+        } else {
+            context.set_source_rgb(0.88, 0.90, 0.88);
+        }
+        context.rectangle(tab_x as f64, (tab_top + 3.0) as f64, width as f64, 16.0);
+        let _ = context.fill();
+        context.set_source_rgb(0.16, 0.22, 0.18);
+        context.move_to((tab_x + 8.0) as f64, (tab_top + 14.0) as f64);
+        let _ = context.show_text(&tab.name);
+        tab_x += width + 6.0;
+    }
+}
+
 fn draw_interaction(context: &Context, state: &CanvasState) {
     match &state.interaction {
         Some(Interaction::Stroke(stroke)) => draw_stroke(context, stroke),
@@ -1931,7 +2800,24 @@ fn draw_interaction(context: &Context, state: &CanvasState) {
         Some(Interaction::MoveSelection { .. })
         | Some(Interaction::Pan { .. })
         | Some(Interaction::Erase)
+        | Some(Interaction::SheetMove { .. })
         | None => {}
+        Some(Interaction::SheetSelect { start, current }) => {
+            if let Some(book) = state.active_layer().spreadsheet.as_ref() {
+                let range = CellRange::new(*start, *current);
+                let a = book.cell_rect(range.start);
+                let b = book.cell_rect(range.end);
+                let bounds = a.union(b);
+                context.set_source_rgba(0.12, 0.46, 0.28, 0.16);
+                context.rectangle(
+                    bounds.x as f64,
+                    bounds.y as f64,
+                    bounds.width as f64,
+                    bounds.height as f64,
+                );
+                let _ = context.fill();
+            }
+        }
     }
 }
 
@@ -1990,13 +2876,20 @@ fn draw_page_fade(context: &Context, width: i32, height: i32, state: &CanvasStat
 }
 
 fn draw_empty_hint(context: &Context, width: i32, height: i32, state: &CanvasState) {
-    if state.interaction.is_some() || state.page().visible_elements().next().is_some() {
+    if state.interaction.is_some()
+        || state.page().visible_elements().next().is_some()
+        || state
+            .page()
+            .layers
+            .iter()
+            .any(|layer| layer.visible && layer.spreadsheet.is_some())
+    {
         return;
     }
     let appear = fx_ease(state.empty_hint, EMPTY_HINT_SECS);
     let lift = 10.0 * (1.0 - appear) as f64;
     let title = "Start a page";
-    let subtitle = "Draw with the pen, type a note, or import an image";
+    let subtitle = "Draw, type a note, or add a spreadsheet layer";
     context.set_font_size(20.0);
     context.select_font_face("Inter", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
     let title_ext = context.text_extents(title).ok();

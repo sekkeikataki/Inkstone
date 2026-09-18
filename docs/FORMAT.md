@@ -36,6 +36,42 @@ Coordinates and sizes are canvas-space floating-point values. Canvas space has n
 positive X points right and positive Y points down. Colors use unpremultiplied channels in `[0, 1]`.
 Every element has a UUID `id` and a `type` discriminator.
 
+## Layer types
+
+A page is a stack of typed layers. Missing `kind` defaults to `notes`, so version 2 notebooks without
+the field keep loading.
+
+- `notes` (default): the original drawing layer. It stores `elements` (strokes, text, shapes,
+  connectors, media).
+- `excel`: a spreadsheet workbook that lives on the canvas. `elements` is empty; the workbook is in
+  `spreadsheet`. Cells are sparse A1 keys (`"B12"`) with the typed input (`10`, `Revenue`,
+  `=SUM(A1:A3)`) and optional style. Formulas use Excel A1 references, `$` anchors, sheet names
+  (`Costs!A1`, `'My Sheet'!B2`), ranges, and a large Excel-compatible function set (`SUM`, `IF`,
+  `VLOOKUP`, `INDEX`, `MATCH`, `COUNTIF`, date serials, and so on). Computed values are recalculated
+  on load rather than cached.
+
+```json
+{
+  "id": "7c1f0a2e-2b1a-4d3c-9f0e-1a2b3c4d5e6f",
+  "name": "Budget",
+  "visible": true,
+  "locked": false,
+  "kind": "excel",
+  "elements": [],
+  "spreadsheet": {
+    "origin": { "x": 48.0, "y": 36.0 },
+    "active_sheet": 0,
+    "sheets": [{
+      "name": "Sheet1",
+      "cells": {
+        "A1": { "input": "10" },
+        "B1": { "input": "=A1*2", "style": { "bold": true, "number_format": "#,##0.00" } }
+      }
+    }]
+  }
+}
+```
+
 ## Elements
 
 - `stroke`: ordered `{x, y, pressure}` samples, stroke kind, RGBA color, and base width.

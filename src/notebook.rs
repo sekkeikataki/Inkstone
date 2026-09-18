@@ -2,6 +2,7 @@ use crate::document::{
     Anchor, Attachment, CanvasSettings, Document, DocumentError, Element, Endpoint, FORMAT_NAME,
     MediaKind, Point, Rect,
 };
+use crate::spreadsheet::{LayerKind, Spreadsheet};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -36,7 +37,12 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    #[serde(default, skip_serializing_if = "LayerKind::is_notes")]
+    pub kind: LayerKind,
+    #[serde(default)]
     pub elements: Vec<Element>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spreadsheet: Option<Spreadsheet>,
 }
 
 impl Layer {
@@ -46,8 +52,26 @@ impl Layer {
             name: name.into(),
             visible: true,
             locked: false,
+            kind: LayerKind::Notes,
             elements: Vec::new(),
+            spreadsheet: None,
         }
+    }
+
+    pub fn spreadsheet(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            visible: true,
+            locked: false,
+            kind: LayerKind::Excel,
+            elements: Vec::new(),
+            spreadsheet: Some(Spreadsheet::new()),
+        }
+    }
+
+    pub fn is_spreadsheet(&self) -> bool {
+        self.kind.is_spreadsheet()
     }
 }
 
@@ -88,9 +112,22 @@ impl NotebookPage {
     }
 
     pub fn content_bounds(&self) -> Option<Rect> {
-        self.visible_elements()
+        let element_bounds = self
+            .visible_elements()
             .map(Element::bounds)
-            .reduce(Rect::union)
+            .reduce(Rect::union);
+        let sheet_bounds = self
+            .layers
+            .iter()
+            .filter(|layer| layer.visible)
+            .filter_map(|layer| layer.spreadsheet.as_ref().map(Spreadsheet::bounds))
+            .reduce(Rect::union);
+        match (element_bounds, sheet_bounds) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     pub fn snap_endpoint(&self, target: Point, max_distance: f32) -> Endpoint {
@@ -140,6 +177,7 @@ pub struct SearchHit {
     pub layer_id: Uuid,
     pub element_id: Uuid,
     pub snippet: String,
+    pub cell: Option<String>,
 }
 
 impl Default for Notebook {
@@ -199,7 +237,9 @@ impl Notebook {
                     name: "Imported notes".to_owned(),
                     visible: true,
                     locked: false,
+                    kind: LayerKind::Notes,
                     elements,
+                    spreadsheet: None,
                 }],
             }],
             assets: Vec::new(),
@@ -262,6 +302,26 @@ impl Notebook {
                         layer.id
                     )));
                 }
+                if layer.kind.is_spreadsheet() {
+                    let spreadsheet = layer.spreadsheet.as_ref().ok_or_else(|| {
+                        DocumentError::Invalid(format!(
+                            "spreadsheet layer {} is missing workbook data",
+                            layer.id
+                        ))
+                    })?;
+                    spreadsheet.validate()?;
+                    if !layer.elements.is_empty() {
+                        return Err(DocumentError::Invalid(format!(
+                            "spreadsheet layer {} cannot also contain drawing elements",
+                            layer.id
+                        )));
+                    }
+                } else if layer.spreadsheet.is_some() {
+                    return Err(DocumentError::Invalid(format!(
+                        "notes layer {} has unexpected spreadsheet data",
+                        layer.id
+                    )));
+                }
                 for element in &layer.elements {
                     if !page_element_ids.insert(element.id())
                         || !structural_ids.insert(element.id())
@@ -317,7 +377,29 @@ impl Notebook {
                             layer_id: layer.id,
                             element_id: element.id(),
                             snippet: text.chars().take(80).collect(),
+                            cell: None,
                         });
+                    }
+                }
+                if let Some(spreadsheet) = &layer.spreadsheet {
+                    for (sheet_index, sheet) in spreadsheet.sheets.iter().enumerate() {
+                        for (addr, input) in sheet.searchable_text() {
+                            let display = spreadsheet.display_cell(sheet_index, addr);
+                            let blob = format!("{} {input} {display}", addr.a1());
+                            if blob.to_lowercase().contains(&needle) {
+                                hits.push(SearchHit {
+                                    page_index,
+                                    page_title: page.title.clone(),
+                                    layer_id: layer.id,
+                                    element_id: layer.id,
+                                    snippet: format!("{}!{} {display}", sheet.name, addr.a1())
+                                        .chars()
+                                        .take(80)
+                                        .collect(),
+                                    cell: Some(addr.a1()),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -367,6 +449,11 @@ impl Notebook {
             bounds.height,
             page.canvas.background.svg()
         );
+        for layer in page.layers.iter().filter(|layer| layer.visible) {
+            if let Some(spreadsheet) = &layer.spreadsheet {
+                svg.push_str(&spreadsheet.svg(layer.id));
+            }
+        }
         for element in page.visible_elements() {
             match element {
                 Element::Media(media) if media.kind == MediaKind::Image => {

@@ -168,6 +168,14 @@ fn install_css() {
         .color-swatch:checked {
             box-shadow: 0 0 0 2px @window_bg_color, 0 0 0 4px @accent_bg_color;
         }
+        .sheet-address {
+            min-width: 4.2em;
+            font-weight: 700;
+            font-family: monospace;
+        }
+        .sheet-formula {
+            min-width: 18em;
+        }
         .swatch-ink { background-color: #1a1f29; }
         .swatch-blue { background-color: #1f61e0; }
         .swatch-red { background-color: #d62933; }
@@ -331,14 +339,14 @@ impl Navigator {
         content.append(&brand);
 
         let search = gtk::SearchEntry::builder()
-            .placeholder_text("Search notes and labels")
+            .placeholder_text("Search notes, labels, and cells")
             .tooltip_text("Press Enter to jump to the next match")
             .build();
         search.add_css_class("sidebar-search");
         content.append(&search);
 
         let add_page = circular_icon_button("list-add-symbolic", "Add page");
-        content.append(&section_header("Pages", Some(&add_page)));
+        content.append(&section_header("Pages", Some(add_page.upcast_ref())));
         content.append(&page_list);
         let previous_page = circular_icon_button("go-previous-symbolic", "Previous page");
         let next_page = circular_icon_button("go-next-symbolic", "Next page");
@@ -361,8 +369,14 @@ impl Navigator {
         page_actions.append(&remove_page);
         content.append(&page_actions);
 
-        let add_layer = circular_icon_button("list-add-symbolic", "Add layer");
-        content.append(&section_header("Layers", Some(&add_layer)));
+        let add_layer = gtk::MenuButton::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Add a notes or spreadsheet layer")
+            .build();
+        add_layer.add_css_class("flat");
+        add_layer.add_css_class("circular");
+        add_layer.add_css_class("circular-icon");
+        content.append(&section_header("Layers", Some(add_layer.upcast_ref())));
         content.append(&layer_list);
         let remove_layer = circular_icon_button("list-remove-symbolic", "Remove layer");
         remove_layer.set_halign(gtk::Align::End);
@@ -472,14 +486,44 @@ impl Navigator {
                 }
             }
         });
-        add_layer.connect_clicked({
+        let add_notes = gtk::Button::builder().label("Notes layer").build();
+        add_notes.add_css_class("flat");
+        let add_sheet = gtk::Button::builder().label("Spreadsheet layer").build();
+        add_sheet.add_css_class("flat");
+        let add_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .margin_start(6)
+            .margin_end(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        add_box.append(&add_notes);
+        add_box.append(&add_sheet);
+        let add_popover = gtk::Popover::builder().child(&add_box).build();
+        add_layer.set_popover(Some(&add_popover));
+        add_notes.connect_clicked({
             let canvas = canvas.clone();
             let navigator = navigator.clone();
             let feedback = feedback.clone();
+            let add_popover = add_popover.clone();
             move |_| {
+                add_popover.popdown();
                 canvas.add_layer();
                 navigator.refresh(&canvas);
-                feedback.show("Layer added");
+                feedback.show("Notes layer added");
+            }
+        });
+        add_sheet.connect_clicked({
+            let canvas = canvas.clone();
+            let navigator = navigator.clone();
+            let feedback = feedback.clone();
+            let add_popover = add_popover.clone();
+            move |_| {
+                add_popover.popdown();
+                canvas.add_spreadsheet_layer();
+                navigator.refresh(&canvas);
+                feedback.show("Spreadsheet layer added");
             }
         });
         remove_layer.connect_clicked({
@@ -590,8 +634,10 @@ impl Navigator {
             self.layer_list.remove(&child);
         }
         let active_layer = canvas.active_layer_index();
-        for (index, (title, visible, locked)) in canvas.layer_summaries().into_iter().enumerate() {
-            let (row, name) = editable_nav_row(&title, None);
+        for (index, (title, visible, locked, kind)) in
+            canvas.layer_summaries().into_iter().enumerate()
+        {
+            let (row, name) = editable_nav_row(&title, Some(kind.label()));
             let vis = layer_icon_toggle("view-reveal-symbolic", "Show or hide layer", visible);
             let lock = layer_icon_toggle("changes-prevent-symbolic", "Lock layer", locked);
             row.add_suffix(&lock);
@@ -647,7 +693,7 @@ impl Navigator {
     }
 }
 
-fn section_header(text: &str, action: Option<&gtk::Button>) -> gtk::Box {
+fn section_header(text: &str, action: Option<&gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -935,6 +981,8 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
         &hint_options("Drag the canvas · middle mouse always pans"),
         Some("pan"),
     );
+    let (sheet_options, sheet_addr, sheet_formula) = spreadsheet_options(canvas);
+    options.add_named(&sheet_options, Some("spreadsheet"));
     options.set_visible_child_name("ink");
 
     let options_frame = gtk::Box::builder()
@@ -1047,6 +1095,30 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
     workspace.add_overlay(&tools_revealer);
     workspace.add_overlay(&options_revealer);
 
+    let formula_updating = Rc::new(Cell::new(false));
+    canvas.connect_sheet_changed({
+        let options = options.clone();
+        let canvas = canvas.clone();
+        let sheet_addr = sheet_addr.clone();
+        let sheet_formula = sheet_formula.clone();
+        let formula_updating = formula_updating.clone();
+        move || {
+            if canvas.active_layer_kind().is_spreadsheet() {
+                options.set_visible_child_name("spreadsheet");
+                formula_updating.set(true);
+                if !sheet_addr.has_focus() {
+                    sheet_addr.set_text(&canvas.sheet_address());
+                }
+                if !sheet_formula.has_focus() {
+                    sheet_formula.set_text(&canvas.sheet_formula());
+                }
+                formula_updating.set(false);
+            } else if options.visible_child_name().as_deref() == Some("spreadsheet") {
+                options.set_visible_child_name("ink");
+            }
+        }
+    });
+
     let status_chip = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -1144,7 +1216,11 @@ fn tool_button(
             glyph.queue_draw();
             if button.is_active() {
                 canvas.set_tool(tool);
-                options.set_visible_child_name(options_name);
+                if canvas.active_layer_kind().is_spreadsheet() {
+                    options.set_visible_child_name("spreadsheet");
+                } else {
+                    options.set_visible_child_name(options_name);
+                }
             }
         }
     });
@@ -1368,6 +1444,109 @@ fn diagram_options(canvas: &Canvas) -> gtk::Box {
     row
 }
 
+fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
+    let row = option_row();
+    let addr = gtk::Entry::builder()
+        .text("A1")
+        .width_chars(7)
+        .max_width_chars(12)
+        .tooltip_text("Name box · type A1 or A1:B5 and press Enter")
+        .build();
+    addr.add_css_class("sheet-address");
+    addr.connect_activate({
+        let canvas = canvas.clone();
+        let addr = addr.clone();
+        move |_| {
+            if !canvas.goto_sheet_address(&addr.text()) {
+                addr.set_text(&canvas.sheet_address());
+            }
+        }
+    });
+    let formula = gtk::Entry::builder()
+        .placeholder_text("=SUM(A1:A10)")
+        .tooltip_text("Formula bar · Enter commits, F2 edits on the canvas")
+        .width_chars(22)
+        .build();
+    formula.add_css_class("sheet-formula");
+    let updating = Rc::new(Cell::new(false));
+    formula.connect_changed({
+        let canvas = canvas.clone();
+        let updating = updating.clone();
+        move |entry| {
+            if updating.get() {
+                return;
+            }
+            canvas.set_sheet_formula(entry.text().to_string());
+        }
+    });
+    formula.connect_activate({
+        let canvas = canvas.clone();
+        move |_| canvas.commit_sheet_formula()
+    });
+    canvas.connect_sheet_changed({
+        let canvas = canvas.clone();
+        let formula = formula.clone();
+        let updating = updating.clone();
+        move || {
+            if formula.has_focus() {
+                return;
+            }
+            updating.set(true);
+            formula.set_text(&canvas.sheet_formula());
+            updating.set(false);
+        }
+    });
+    let bold = gtk::Button::builder()
+        .label("B")
+        .tooltip_text("Bold selected cells (Ctrl+B)")
+        .build();
+    bold.add_css_class("flat");
+    bold.add_css_class("pill");
+    bold.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.toggle_sheet_bold()
+    });
+    let align = gtk::Button::builder()
+        .label("Align")
+        .tooltip_text("Cycle left, center, and right alignment")
+        .build();
+    align.add_css_class("flat");
+    align.add_css_class("pill");
+    align.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.cycle_sheet_align()
+    });
+    let fill = gtk::Button::builder()
+        .label("Fill")
+        .tooltip_text("Fill the rest of the selection from the first row or cell")
+        .build();
+    fill.add_css_class("flat");
+    fill.add_css_class("pill");
+    fill.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.fill_sheet_selection()
+    });
+    let sheet = gtk::Button::builder()
+        .label("Sheet")
+        .tooltip_text("Add a worksheet tab")
+        .build();
+    sheet.add_css_class("flat");
+    sheet.add_css_class("pill");
+    sheet.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.add_workbook_sheet()
+    });
+    row.append(&option_hint("fx"));
+    row.append(&addr);
+    row.append(&formula);
+    row.append(&bold);
+    row.append(&align);
+    row.append(&fill);
+    row.append(&sheet);
+    row.append(&sheet_fill_colors(canvas));
+    (row, addr, formula)
+}
+
 fn hint_options(text: &str) -> gtk::Box {
     let row = option_row();
     row.append(&option_hint(text));
@@ -1390,6 +1569,35 @@ fn option_hint(text: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
     label.add_css_class("dim-label");
     label
+}
+
+fn sheet_fill_colors(canvas: &Canvas) -> gtk::Box {
+    const COLORS: [(&str, &str, Color); 6] = [
+        ("swatch-ink", "Ink", Color::INK),
+        ("swatch-blue", "Blue", Color::BLUE),
+        ("swatch-red", "Red", Color::rgb(0.84, 0.16, 0.20)),
+        ("swatch-green", "Green", Color::rgb(0.05, 0.56, 0.32)),
+        ("swatch-violet", "Violet", Color::rgb(0.48, 0.20, 0.78)),
+        ("swatch-amber", "Amber", Color::rgb(0.95, 0.62, 0.05)),
+    ];
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .build();
+    for (class, name, color) in COLORS {
+        let swatch = gtk::Button::builder().build();
+        swatch.set_tooltip_text(Some(&format!("Fill selected cells with {name}")));
+        swatch.add_css_class("color-swatch");
+        swatch.add_css_class(class);
+        swatch.add_css_class("flat");
+        swatch.connect_clicked({
+            let canvas = canvas.clone();
+            move |_| canvas.fill_sheet_color(color)
+        });
+        row.append(&swatch);
+    }
+    row
 }
 
 fn color_picker(canvas: &Canvas) -> gtk::Box {

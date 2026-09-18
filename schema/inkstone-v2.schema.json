@@ -109,6 +109,7 @@
         "name": { "type": "string" },
         "visible": { "type": "boolean" },
         "locked": { "type": "boolean" },
+        "kind": { "enum": ["notes", "excel"] },
         "elements": {
           "type": "array",
           "items": {
@@ -120,7 +121,8 @@
               { "$ref": "#/$defs/media" }
             ]
           }
-        }
+        },
+        "spreadsheet": { "$ref": "#/$defs/spreadsheet" }
       }
     },
     "strokePoint": {
@@ -264,6 +266,69 @@
         "bounds": { "$ref": "#/$defs/rect" },
         "alt_text": { "type": "string" },
         "caption": { "type": "string" }
+      }
+    },
+    "spreadsheet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "sheets", "active_sheet"],
+      "properties": {
+        "origin": { "$ref": "#/$defs/point" },
+        "active_sheet": { "type": "integer", "minimum": 0 },
+        "sheets": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sheet" }
+        }
+      }
+    },
+    "sheet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "cells": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/sheetCell" }
+        },
+        "column_widths": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "row_heights": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "merged": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "frozen_rows": { "type": "integer", "minimum": 0 },
+        "frozen_cols": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sheetCell": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input": { "type": "string" },
+        "style": { "$ref": "#/$defs/cellStyle" }
+      }
+    },
+    "cellStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bold": { "type": "boolean" },
+        "italic": { "type": "boolean" },
+        "underline": { "type": "boolean" },
+        "color": { "$ref": "#/$defs/color" },
+        "fill": { "$ref": "#/$defs/color" },
+        "h_align": { "enum": ["general", "left", "center", "right"] },
+        "v_align": { "enum": ["top", "center", "bottom"] },
+        "number_format": { "type": "string" },
+        "font_size": { "type": "number", "minimum": 0 }
       }
     }
   }

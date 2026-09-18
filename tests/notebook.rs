@@ -32,7 +32,9 @@ fn notebook_round_trip_preserves_pages_layers_and_search() {
             name: "Equations".to_owned(),
             visible: true,
             locked: true,
+            kind: Default::default(),
             elements: vec![text("torque curve", 40.0)],
+            spreadsheet: None,
         }],
     });
     let directory = tempdir().unwrap();
