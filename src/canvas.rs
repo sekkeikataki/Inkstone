@@ -246,6 +246,10 @@ impl Canvas {
         &self.area
     }
 
+    pub fn tool(&self) -> Tool {
+        self.state.borrow().tool
+    }
+
     pub fn set_tool(&self, tool: Tool) {
         let mut state = self.state.borrow_mut();
         state.tool = tool;

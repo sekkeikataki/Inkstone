@@ -997,43 +997,26 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
 
     let select = tool_button(
         "Select (click or lasso)",
-        "select",
         Tool::Select,
         canvas,
         &options,
         None,
     );
-    let pen = tool_button("Pen", "ink", Tool::Pen, canvas, &options, Some(&select));
+    let pen = tool_button("Pen", Tool::Pen, canvas, &options, Some(&select));
     pen.set_active(true);
     let highlighter = tool_button(
         "Highlighter",
-        "ink",
         Tool::Highlighter,
         canvas,
         &options,
         Some(&select),
     );
-    let eraser = tool_button(
-        "Eraser",
-        "eraser",
-        Tool::Eraser,
-        canvas,
-        &options,
-        Some(&select),
-    );
-    let pan = tool_button("Pan", "pan", Tool::Pan, canvas, &options, Some(&select));
-    let text = tool_button("Text", "text", Tool::Text, canvas, &options, Some(&select));
-    let shape = tool_button(
-        "Shape",
-        "diagram",
-        Tool::Shape,
-        canvas,
-        &options,
-        Some(&select),
-    );
+    let eraser = tool_button("Eraser", Tool::Eraser, canvas, &options, Some(&select));
+    let pan = tool_button("Pan", Tool::Pan, canvas, &options, Some(&select));
+    let text = tool_button("Text", Tool::Text, canvas, &options, Some(&select));
+    let shape = tool_button("Shape", Tool::Shape, canvas, &options, Some(&select));
     let connector = tool_button(
         "Connector",
-        "diagram",
         Tool::Connector,
         canvas,
         &options,
@@ -1104,8 +1087,8 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
         let sheet_formula = sheet_formula.clone();
         let formula_updating = formula_updating.clone();
         move || {
+            sync_options_stack(&canvas, &options);
             if canvas.active_layer_kind().is_spreadsheet() {
-                options.set_visible_child_name("spreadsheet");
                 formula_updating.set(true);
                 if !sheet_addr.has_focus() {
                     sheet_addr.set_text(&canvas.sheet_address());
@@ -1114,8 +1097,6 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
                     sheet_formula.set_text(&canvas.sheet_formula());
                 }
                 formula_updating.set(false);
-            } else if options.visible_child_name().as_deref() == Some("spreadsheet") {
-                options.set_visible_child_name("ink");
             }
         }
     });
@@ -1187,9 +1168,24 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
     )
 }
 
+fn sync_options_stack(canvas: &Canvas, options: &gtk::Stack) {
+    if canvas.active_layer_kind().is_spreadsheet() {
+        options.set_visible_child_name("spreadsheet");
+        return;
+    }
+    let page = match canvas.tool() {
+        Tool::Select => "select",
+        Tool::Pen | Tool::Highlighter => "ink",
+        Tool::Eraser => "eraser",
+        Tool::Pan => "pan",
+        Tool::Text => "text",
+        Tool::Shape | Tool::Connector => "diagram",
+    };
+    options.set_visible_child_name(page);
+}
+
 fn tool_button(
     tooltip: &str,
-    options_name: &'static str,
     tool: Tool,
     canvas: &Canvas,
     options: &gtk::Stack,
@@ -1217,11 +1213,7 @@ fn tool_button(
             glyph.queue_draw();
             if button.is_active() {
                 canvas.set_tool(tool);
-                if canvas.active_layer_kind().is_spreadsheet() {
-                    options.set_visible_child_name("spreadsheet");
-                } else {
-                    options.set_visible_child_name(options_name);
-                }
+                sync_options_stack(&canvas, &options);
             }
         }
     });
