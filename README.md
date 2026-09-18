@@ -10,7 +10,9 @@ runtime, Electron layer, or network service.
 - Mouse and single-touch drawing; middle-button or Pan-tool panning; touchpad scrolling
 - Two-finger pinch zoom and Ctrl+scroll zoom around the pointer
 - GTK tablet/stylus input with pressure-width rendering and automatic eraser-tip detection
-- Multi-page notebooks with independent layered canvases, visibility, locking, and grid controls
+- Multi-page notebooks with typed layers: canvas layers for drawing and Excel layers with
+  in-notebook spreadsheets, formulas, multi-sheet tabs, and `.xlsx` import/export
+- Independent layered canvases with visibility, locking, and grid controls
 - Responsive libadwaita workspace: clickable, in-place-renamable page/layer lists, a grouped
   left tool rail with contextual color/width options, live zoom, canvas-first chrome that slides
   away while drawing, and short page/selection/empty-state motion
@@ -19,7 +21,7 @@ runtime, Electron layer, or network service.
 - Pen colors, pressure ink, translucent highlighter, and whole-object eraser
 - Rectangle, ellipse, resistor, capacitor, ground, motor, gear, bearing, spring, and beam symbols
 - Orthogonal connectors that snap to semantic anchors and retain those relationships
-- Embedded PNG/JPEG/WebP/GIF images and portable embedded PDF attachment cards
+- Embedded PNG/JPEG/WebP/GIF images, portable embedded PDF attachment cards, and Excel workbook import
 - Undo/redo, debounced autosave after the first manual save, protected unsaved close/new/open,
   native file dialogs, SVG page export, and multi-page PDF export
 - Open, pretty-printed `.inkstone` JSON with UUIDs, text, pressure points, shapes, labels, connector
@@ -64,7 +66,10 @@ the chip above the canvas. Click a page or layer name in the sidebar to rename i
 | Select/lasso and move | Select tool, then click/drag or drag an empty region |
 | Duplicate/delete selection | Ctrl+D / Delete |
 | Search | Ctrl+F, then Enter for the next match |
-| Import image/PDF | Ctrl+I, or File → Import Image or PDF |
+| Import image/PDF/Excel | Ctrl+I, or File → Import Image, PDF, or Excel |
+| Add Excel layer | Sidebar → spreadsheet button next to Add layer |
+| Edit spreadsheet cells | Select an Excel layer, click a cell, use the formula bar or type on canvas |
+| Export Excel layer | File → Export Excel Layer (active Excel layer only) |
 | Save/open | Ctrl+S / Ctrl+O |
 | Undo/redo | Ctrl+Z / Ctrl+Shift+Z |
 | Reset view | Ctrl+0 |

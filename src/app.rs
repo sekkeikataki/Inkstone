@@ -116,6 +116,15 @@ fn install_css() {
             padding: 6px 12px;
             min-height: 48px;
         }
+        .formula-bar {
+            border-radius: 14px;
+            padding: 6px 10px;
+            min-height: 36px;
+        }
+        .formula-cell-label {
+            min-width: 52px;
+            font-weight: 600;
+        }
         .tool-button {
             border-radius: 999px;
             min-width: 38px;
@@ -361,8 +370,16 @@ impl Navigator {
         page_actions.append(&remove_page);
         content.append(&page_actions);
 
-        let add_layer = circular_icon_button("list-add-symbolic", "Add layer");
-        content.append(&section_header("Layers", Some(&add_layer)));
+        let add_layer = circular_icon_button("list-add-symbolic", "Add canvas layer");
+        let add_excel_layer =
+            circular_icon_button("x-office-spreadsheet-symbolic", "Add Excel layer");
+        let layer_actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        layer_actions.append(&add_layer);
+        layer_actions.append(&add_excel_layer);
+        content.append(&section_header("Layers", Some(&layer_actions)));
         content.append(&layer_list);
         let remove_layer = circular_icon_button("list-remove-symbolic", "Remove layer");
         remove_layer.set_halign(gtk::Align::End);
@@ -479,7 +496,17 @@ impl Navigator {
             move |_| {
                 canvas.add_layer();
                 navigator.refresh(&canvas);
-                feedback.show("Layer added");
+                feedback.show("Canvas layer added");
+            }
+        });
+        add_excel_layer.connect_clicked({
+            let canvas = canvas.clone();
+            let navigator = navigator.clone();
+            let feedback = feedback.clone();
+            move |_| {
+                canvas.add_excel_layer();
+                navigator.refresh(&canvas);
+                feedback.show("Excel layer added");
             }
         });
         remove_layer.connect_clicked({
@@ -647,7 +674,7 @@ impl Navigator {
     }
 }
 
-fn section_header(text: &str, action: Option<&gtk::Button>) -> gtk::Box {
+fn section_header(text: &str, action: Option<&impl IsA<gtk::Widget>>) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -779,9 +806,13 @@ fn build_menu() -> gio::Menu {
     file.append(Some("Open…"), Some("win.open"));
     file.append(Some("Save"), Some("win.save"));
     file.append(Some("Save As…"), Some("win.save-as"));
-    file.append(Some("Import Image or PDF…"), Some("win.import-media"));
+    file.append(
+        Some("Import Image, PDF, or Excel…"),
+        Some("win.import-media"),
+    );
     file.append(Some("Export SVG…"), Some("win.export-svg"));
     file.append(Some("Export PDF…"), Some("win.export-pdf"));
+    file.append(Some("Export Excel Layer…"), Some("win.export-spreadsheet"));
     menu.append_section(None, &file);
 
     let edit = gio::Menu::new();
@@ -860,9 +891,11 @@ fn play_chrome_entrance(toolbar: &adw::ToolbarView, chrome: &WorkspaceChrome) {
 fn wire_immersive_chrome(canvas: &Canvas, toolbar: &adw::ToolbarView, chrome: &WorkspaceChrome) {
     let generation = Rc::new(Cell::new(0_u64));
     canvas.connect_busy({
+        let canvas = canvas.clone();
         let toolbar = toolbar.clone();
         let tools = chrome.tools.clone();
         let options = chrome.options.clone();
+        let formula = chrome.formula.clone();
         let status = chrome.status.clone();
         let zoom = chrome.zoom.clone();
         let generation = generation.clone();
@@ -872,15 +905,18 @@ fn wire_immersive_chrome(canvas: &Canvas, toolbar: &adw::ToolbarView, chrome: &W
                 toolbar.set_reveal_top_bars(false);
                 tools.set_reveal_child(false);
                 options.set_reveal_child(false);
+                formula.set_reveal_child(false);
                 status.set_reveal_child(false);
                 zoom.set_reveal_child(false);
                 return;
             }
             let token = generation.get().wrapping_add(1);
             generation.set(token);
+            let canvas = canvas.clone();
             let toolbar = toolbar.clone();
             let tools = tools.clone();
             let options = options.clone();
+            let formula = formula.clone();
             let status = status.clone();
             let zoom = zoom.clone();
             let generation = generation.clone();
@@ -889,6 +925,7 @@ fn wire_immersive_chrome(canvas: &Canvas, toolbar: &adw::ToolbarView, chrome: &W
                     toolbar.set_reveal_top_bars(true);
                     tools.set_reveal_child(true);
                     options.set_reveal_child(true);
+                    formula.set_reveal_child(canvas.active_layer_is_excel());
                     status.set_reveal_child(true);
                     zoom.set_reveal_child(true);
                 }
@@ -902,6 +939,7 @@ fn wire_immersive_chrome(canvas: &Canvas, toolbar: &adw::ToolbarView, chrome: &W
 struct WorkspaceChrome {
     tools: gtk::Revealer,
     options: gtk::Revealer,
+    formula: gtk::Revealer,
     status: gtk::Revealer,
     zoom: gtk::Revealer,
 }
@@ -1047,6 +1085,68 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
     workspace.add_overlay(&tools_revealer);
     workspace.add_overlay(&options_revealer);
 
+    let formula_cell = gtk::Label::builder().label("A1").xalign(0.0).build();
+    formula_cell.add_css_class("formula-cell-label");
+    formula_cell.add_css_class("dim-label");
+    let formula_entry = gtk::Entry::builder()
+        .placeholder_text("Enter a value or formula")
+        .hexpand(true)
+        .build();
+    let formula_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(72)
+        .margin_end(72)
+        .margin_top(14)
+        .build();
+    formula_bar.add_css_class("floating-panel");
+    formula_bar.add_css_class("formula-bar");
+    formula_bar.append(&formula_cell);
+    formula_bar.append(&formula_entry);
+    let formula_revealer = chrome_revealer(
+        &formula_bar,
+        gtk::RevealerTransitionType::SlideDown,
+        gtk::Align::Fill,
+        gtk::Align::Start,
+    );
+    formula_revealer.set_reveal_child(false);
+    workspace.add_overlay(&formula_revealer);
+
+    let refresh_formula_bar = {
+        let canvas = canvas.clone();
+        let formula_revealer = formula_revealer.clone();
+        let formula_cell = formula_cell.clone();
+        let formula_entry = formula_entry.clone();
+        Rc::new(move || {
+            let excel = canvas.active_layer_is_excel();
+            formula_revealer.set_reveal_child(excel);
+            if excel {
+                formula_cell.set_text(&canvas.spreadsheet_cell_label());
+                formula_entry.set_text(&canvas.spreadsheet_formula());
+            }
+        })
+    };
+    formula_entry.connect_changed({
+        let canvas = canvas.clone();
+        move |entry| {
+            if canvas.active_layer_is_excel() {
+                canvas.set_spreadsheet_formula(entry.text().to_string());
+            }
+        }
+    });
+    formula_entry.connect_activate({
+        let canvas = canvas.clone();
+        let refresh_formula_bar = refresh_formula_bar.clone();
+        move |_| {
+            canvas.commit_spreadsheet_formula();
+            refresh_formula_bar();
+        }
+    });
+    canvas.connect_layer_changed({
+        let refresh_formula_bar = refresh_formula_bar.clone();
+        move || refresh_formula_bar()
+    });
+
     let status_chip = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -1108,6 +1208,7 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
         WorkspaceChrome {
             tools: tools_revealer,
             options: options_revealer,
+            formula: formula_revealer,
             status: status_revealer,
             zoom: zoom_revealer,
         },
@@ -1542,6 +1643,12 @@ fn install_actions(
         let status = status.clone();
         move || choose_import(&window, &canvas, &status)
     });
+    add_action(window, "export-spreadsheet", {
+        let window = window.clone();
+        let canvas = canvas.clone();
+        let status = status.clone();
+        move || choose_export_spreadsheet(&window, &canvas, &status)
+    });
     add_action(window, "undo", {
         let window = window.clone();
         let canvas = canvas.clone();
@@ -1833,7 +1940,7 @@ fn choose_export_pdf(window: &adw::ApplicationWindow, canvas: &Canvas, status: &
 
 fn choose_import(window: &adw::ApplicationWindow, canvas: &Canvas, status: &Feedback) {
     let chooser = gtk::FileChooserNative::builder()
-        .title("Import image or PDF")
+        .title("Import image, PDF, or Excel")
         .transient_for(window)
         .modal(true)
         .action(gtk::FileChooserAction::Open)
@@ -1841,8 +1948,11 @@ fn choose_import(window: &adw::ApplicationWindow, canvas: &Canvas, status: &Feed
         .cancel_label("Cancel")
         .build();
     let filter = gtk::FileFilter::new();
-    filter.set_name(Some("Images and PDF documents"));
-    for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif", "*.pdf"] {
+    filter.set_name(Some("Images, PDF, and Excel"));
+    for pattern in [
+        "*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif", "*.pdf", "*.xlsx", "*.xlsm", "*.xls",
+        "*.ods",
+    ] {
         filter.add_pattern(pattern);
     }
     chooser.add_filter(&filter);
@@ -1855,7 +1965,44 @@ fn choose_import(window: &adw::ApplicationWindow, canvas: &Canvas, status: &Feed
                 && let Some(path) = chooser.file().and_then(|file| file.path())
             {
                 match canvas.import_media(&path) {
-                    Ok(()) => refresh_status(&window, &canvas, &status, "Imported media"),
+                    Ok(()) => refresh_status(&window, &canvas, &status, "Imported file"),
+                    Err(error) => show_error(&window, &error.to_string()),
+                }
+            }
+            chooser.destroy();
+        }
+    });
+    chooser.show();
+}
+
+fn choose_export_spreadsheet(window: &adw::ApplicationWindow, canvas: &Canvas, status: &Feedback) {
+    if !canvas.active_layer_is_excel() {
+        show_error(window, "Select an Excel layer before exporting");
+        return;
+    }
+    let chooser = gtk::FileChooserNative::builder()
+        .title("Export Excel layer")
+        .transient_for(window)
+        .modal(true)
+        .action(gtk::FileChooserAction::Save)
+        .accept_label("Export")
+        .cancel_label("Cancel")
+        .build();
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Excel workbook"));
+    filter.add_pattern("*.xlsx");
+    chooser.add_filter(&filter);
+    chooser.connect_response({
+        let window = window.clone();
+        let canvas = canvas.clone();
+        let status = status.clone();
+        move |chooser, response| {
+            if response == gtk::ResponseType::Accept
+                && let Some(path) = chooser.file().and_then(|file| file.path())
+            {
+                let path = with_extension(path, "xlsx");
+                match canvas.export_active_spreadsheet(&path) {
+                    Ok(()) => refresh_status(&window, &canvas, &status, "Exported Excel layer"),
                     Err(error) => show_error(&window, &error.to_string()),
                 }
             }

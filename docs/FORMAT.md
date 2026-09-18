@@ -25,6 +25,7 @@ Top-level fields:
       "name": "Notes",
       "visible": true,
       "locked": false,
+      "layer_type": "canvas",
       "elements": []
     }]
   }],
@@ -48,6 +49,48 @@ Every element has a UUID `id` and a `type` discriminator.
 Assets are stored once in the top-level `assets` array with UUID, filename, MIME type, and standard
 base64 bytes. This keeps element relationships small and lets multiple future media frames reference
 one payload. Current imports are capped at 64 MiB.
+
+## Layer types
+
+Layers are typed containers. The default `canvas` layer holds drawing elements. An `excel` layer
+stores a spreadsheet payload instead of canvas elements:
+
+```json
+{
+  "id": "7b0e0f2a-0f0a-4a1a-9a0a-0a0a0a0a0a0a",
+  "name": "Budget",
+  "visible": true,
+  "locked": false,
+  "layer_type": "excel",
+  "elements": [],
+  "spreadsheet": {
+    "origin": { "x": 80.0, "y": 80.0 },
+    "bounds": { "x": 80.0, "y": 80.0, "width": 746.0, "height": 528.0 },
+    "active_sheet": 0,
+    "sheets": [{
+      "name": "Budget",
+      "cells": {
+        "A1": { "value": "Revenue" },
+        "B1": { "value": "100" },
+        "A2": { "value": "Costs" },
+        "B2": { "value": "40" },
+        "A3": { "value": "Profit" },
+        "B3": { "value": "=B1-B2" }
+      }
+    }],
+    "default_column_width": 88.0,
+    "default_row_height": 24.0,
+    "show_grid_lines": true,
+    "frozen_rows": 0,
+    "frozen_columns": 0
+  }
+}
+```
+
+Cell keys use Excel-style `A1` notation. Values may be plain text, numbers, booleans, or formulas
+starting with `=`. Inkstone evaluates common spreadsheet functions (`SUM`, `AVERAGE`, `IF`, and
+others) when rendering and exporting. Excel workbooks (`.xlsx`) can be imported as a new excel
+layer or exported from the active excel layer.
 
 An attachment is explicit:
 

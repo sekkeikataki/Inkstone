@@ -2,6 +2,7 @@ use crate::document::{
     Anchor, Attachment, CanvasSettings, Document, DocumentError, Element, Endpoint, FORMAT_NAME,
     MediaKind, Point, Rect,
 };
+use crate::spreadsheet::SpreadsheetLayer;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -30,13 +31,26 @@ impl Asset {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerType {
+    #[default]
+    Canvas,
+    Excel,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Layer {
     pub id: Uuid,
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    #[serde(default)]
+    pub layer_type: LayerType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elements: Vec<Element>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spreadsheet: Option<SpreadsheetLayer>,
 }
 
 impl Layer {
@@ -46,8 +60,37 @@ impl Layer {
             name: name.into(),
             visible: true,
             locked: false,
+            layer_type: LayerType::Canvas,
             elements: Vec::new(),
+            spreadsheet: None,
         }
+    }
+
+    pub fn excel(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            id: Uuid::new_v4(),
+            name: name.clone(),
+            visible: true,
+            locked: false,
+            layer_type: LayerType::Excel,
+            elements: Vec::new(),
+            spreadsheet: Some(SpreadsheetLayer {
+                sheets: vec![crate::spreadsheet::Sheet {
+                    name,
+                    ..Default::default()
+                }],
+                ..SpreadsheetLayer::default()
+            }),
+        }
+    }
+
+    pub fn is_excel(&self) -> bool {
+        self.layer_type == LayerType::Excel
+    }
+
+    pub fn is_canvas(&self) -> bool {
+        self.layer_type == LayerType::Canvas
     }
 }
 
@@ -76,8 +119,12 @@ impl NotebookPage {
     pub fn visible_elements(&self) -> impl Iterator<Item = &Element> {
         self.layers
             .iter()
-            .filter(|layer| layer.visible)
+            .filter(|layer| layer.visible && layer.is_canvas())
             .flat_map(|layer| layer.elements.iter())
+    }
+
+    pub fn visible_layers(&self) -> impl Iterator<Item = &Layer> {
+        self.layers.iter().filter(|layer| layer.visible)
     }
 
     pub fn element_mut(&mut self, id: Uuid) -> Option<&mut Element> {
@@ -88,9 +135,20 @@ impl NotebookPage {
     }
 
     pub fn content_bounds(&self) -> Option<Rect> {
-        self.visible_elements()
+        let element_bounds = self
+            .visible_elements()
             .map(Element::bounds)
-            .reduce(Rect::union)
+            .reduce(Rect::union);
+        let spreadsheet_bounds = self
+            .visible_layers()
+            .filter_map(|layer| layer.spreadsheet.as_ref())
+            .map(SpreadsheetLayer::content_bounds)
+            .reduce(Rect::union);
+        match (element_bounds, spreadsheet_bounds) {
+            (Some(left), Some(right)) => Some(left.union(right)),
+            (Some(bounds), None) | (None, Some(bounds)) => Some(bounds),
+            (None, None) => None,
+        }
     }
 
     pub fn snap_endpoint(&self, target: Point, max_distance: f32) -> Endpoint {
@@ -199,7 +257,9 @@ impl Notebook {
                     name: "Imported notes".to_owned(),
                     visible: true,
                     locked: false,
+                    layer_type: LayerType::Canvas,
                     elements,
+                    spreadsheet: None,
                 }],
             }],
             assets: Vec::new(),
@@ -262,6 +322,31 @@ impl Notebook {
                         layer.id
                     )));
                 }
+                match layer.layer_type {
+                    LayerType::Canvas => {
+                        if layer.spreadsheet.is_some() {
+                            return Err(DocumentError::Invalid(format!(
+                                "canvas layer {} must not include spreadsheet data",
+                                layer.id
+                            )));
+                        }
+                    }
+                    LayerType::Excel => {
+                        let Some(spreadsheet) = &layer.spreadsheet else {
+                            return Err(DocumentError::Invalid(format!(
+                                "excel layer {} is missing spreadsheet data",
+                                layer.id
+                            )));
+                        };
+                        if !layer.elements.is_empty() {
+                            return Err(DocumentError::Invalid(format!(
+                                "excel layer {} must not contain canvas elements",
+                                layer.id
+                            )));
+                        }
+                        spreadsheet.validate()?;
+                    }
+                }
                 for element in &layer.elements {
                     if !page_element_ids.insert(element.id())
                         || !structural_ids.insert(element.id())
@@ -320,6 +405,18 @@ impl Notebook {
                         });
                     }
                 }
+                if let Some(spreadsheet) = &layer.spreadsheet {
+                    let text = spreadsheet.searchable_text();
+                    if text.to_lowercase().contains(&needle) {
+                        hits.push(SearchHit {
+                            page_index,
+                            page_title: page.title.clone(),
+                            layer_id: layer.id,
+                            element_id: layer.id,
+                            snippet: text.chars().take(80).collect(),
+                        });
+                    }
+                }
             }
         }
         hits
@@ -367,6 +464,11 @@ impl Notebook {
             bounds.height,
             page.canvas.background.svg()
         );
+        for layer in page.visible_layers() {
+            if let Some(spreadsheet) = &layer.spreadsheet {
+                svg.push_str(&spreadsheet.to_svg());
+            }
+        }
         for element in page.visible_elements() {
             match element {
                 Element::Media(media) if media.kind == MediaKind::Image => {

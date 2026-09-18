@@ -2,7 +2,8 @@ use crate::document::{
     Color, Connector, DocumentError, Element, Endpoint, MediaElement, MediaKind, Point, Rect,
     Shape, ShapeKind, Stroke, StrokeKind, StrokePoint, StrokeStyle, TextNote,
 };
-use crate::notebook::{Asset, Layer, Notebook, NotebookPage, SearchHit};
+use crate::notebook::{Asset, Layer, LayerType, Notebook, NotebookPage, SearchHit};
+use crate::spreadsheet::{CellAddress, SpreadsheetLayer};
 use base64::Engine;
 use cairo::PdfSurface;
 use gdk_pixbuf::{Pixbuf, PixbufLoader};
@@ -75,11 +76,15 @@ struct CanvasState {
     search_position: usize,
     view_animation_generation: u64,
     view_listeners: Vec<Rc<dyn Fn(u32)>>,
+    layer_listeners: Vec<Rc<dyn Fn()>>,
     busy_listeners: Vec<Rc<dyn Fn(bool)>>,
     selection_flash: Option<Instant>,
     page_fade: Option<Instant>,
     empty_hint: Option<Instant>,
     fx_generation: u64,
+    spreadsheet_selection: Option<CellAddress>,
+    spreadsheet_edit_buffer: String,
+    spreadsheet_editing: bool,
 }
 
 enum Interaction {
@@ -135,6 +140,12 @@ enum HistoryEntry {
         index: usize,
         stored: Option<Layer>,
     },
+    SpreadsheetCellChanged {
+        page_id: Uuid,
+        layer_id: Uuid,
+        address: CellAddress,
+        stored: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -171,11 +182,15 @@ impl Default for CanvasState {
             search_position: 0,
             view_animation_generation: 0,
             view_listeners: Vec::new(),
+            layer_listeners: Vec::new(),
             busy_listeners: Vec::new(),
             selection_flash: None,
             page_fade: None,
             empty_hint: Some(Instant::now()),
             fx_generation: 0,
+            spreadsheet_selection: Some(CellAddress::default()),
+            spreadsheet_edit_buffer: String::new(),
+            spreadsheet_editing: false,
         }
     }
 }
@@ -201,6 +216,7 @@ impl Canvas {
         attach_pointer_input(&area, &state);
         attach_stylus_input(&area, &state);
         attach_view_controls(&area, &state);
+        attach_keyboard_input(&area, &state);
         area.connect_realize({
             let state = state.clone();
             move |area| {
@@ -273,6 +289,7 @@ impl Canvas {
         state.redo.clear();
         state.selection.clear();
         state.image_cache.clear();
+        state.sync_spreadsheet_ui();
         state.begin_page_fade();
         drop(state);
         self.emit_view_changed();
@@ -293,6 +310,7 @@ impl Canvas {
         state.dirty = false;
         state.selection.clear();
         state.rebuild_image_cache();
+        state.sync_spreadsheet_ui();
         state.begin_page_fade();
         drop(state);
         self.emit_view_changed();
@@ -399,7 +417,16 @@ impl Canvas {
             .notebook
             .pages
             .iter()
-            .map(|page| page.elements().count())
+            .map(|page| {
+                let elements = page.elements().count();
+                let cells = page
+                    .layers
+                    .iter()
+                    .filter_map(|layer| layer.spreadsheet.as_ref())
+                    .map(|sheet| sheet.active_sheet().cells.len())
+                    .sum::<usize>();
+                elements + cells
+            })
             .collect()
     }
 
@@ -409,8 +436,67 @@ impl Canvas {
             .page()
             .layers
             .iter()
-            .map(|layer| (layer.name.clone(), layer.visible, layer.locked))
+            .map(|layer| {
+                let prefix = if layer.is_excel() { "📊 " } else { "" };
+                (
+                    format!("{prefix}{}", layer.name),
+                    layer.visible,
+                    layer.locked,
+                )
+            })
             .collect()
+    }
+
+    pub fn active_layer_is_excel(&self) -> bool {
+        self.state.borrow().active_layer().is_excel()
+    }
+
+    pub fn spreadsheet_formula(&self) -> String {
+        let state = self.state.borrow();
+        if state.spreadsheet_editing {
+            return state.spreadsheet_edit_buffer.clone();
+        }
+        let Some(spreadsheet) = state.active_layer().spreadsheet.as_ref() else {
+            return String::new();
+        };
+        let Some(address) = state.spreadsheet_selection else {
+            return String::new();
+        };
+        spreadsheet.get_raw(address).unwrap_or("").to_owned()
+    }
+
+    pub fn set_spreadsheet_formula(&self, text: String) {
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_excel() {
+            return;
+        }
+        state.spreadsheet_edit_buffer = text;
+        state.spreadsheet_editing = true;
+        drop(state);
+        self.area.queue_draw();
+    }
+
+    pub fn commit_spreadsheet_formula(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_excel() {
+            return;
+        }
+        let Some(address) = state.spreadsheet_selection else {
+            return;
+        };
+        let value = state.spreadsheet_edit_buffer.clone();
+        state.commit_spreadsheet_cell(address, value);
+        drop(state);
+        self.schedule_autosave();
+        self.area.queue_draw();
+    }
+
+    pub fn spreadsheet_cell_label(&self) -> String {
+        let state = self.state.borrow();
+        state
+            .spreadsheet_selection
+            .map(|address| address.to_a1())
+            .unwrap_or_else(|| "A1".to_owned())
     }
 
     pub fn page_titles(&self) -> Vec<String> {
@@ -482,8 +568,10 @@ impl Canvas {
         state.active_layer = 0;
         state.selection.clear();
         state.search_position = 0;
+        state.sync_spreadsheet_ui();
         state.begin_page_fade();
         drop(state);
+        self.emit_layer_changed();
         start_canvas_fx(&self.area, &self.state);
         self.reset_view();
     }
@@ -566,8 +654,10 @@ impl Canvas {
         if index < state.page().layers.len() {
             state.active_layer = index;
             state.selection.clear();
+            state.sync_spreadsheet_ui();
         }
         drop(state);
+        self.emit_layer_changed();
         self.area.queue_draw();
     }
 
@@ -585,8 +675,74 @@ impl Canvas {
         });
         state.dirty = true;
         drop(state);
+        self.emit_layer_changed();
         self.schedule_autosave();
         self.area.queue_draw();
+    }
+
+    pub fn add_excel_layer(&self) {
+        let mut state = self.state.borrow_mut();
+        let page_id = state.page().id;
+        let layer = Layer::excel(format!("Sheet {}", state.page().layers.len() + 1));
+        let id = layer.id;
+        state.page_mut().layers.push(layer);
+        state.active_layer = state.page().layers.len() - 1;
+        state.sync_spreadsheet_ui();
+        state.push_history(HistoryEntry::LayerAdded {
+            page_id,
+            id,
+            stored: None,
+        });
+        state.dirty = true;
+        drop(state);
+        self.schedule_autosave();
+        self.area.queue_draw();
+    }
+
+    pub fn import_spreadsheet(&self, path: &Path) -> Result<(), DocumentError> {
+        let spreadsheet = SpreadsheetLayer::from_xlsx(path)?;
+        let mut state = self.state.borrow_mut();
+        let page_id = state.page().id;
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Imported sheet")
+            .to_owned();
+        let layer = Layer {
+            id: Uuid::new_v4(),
+            name: name.clone(),
+            visible: true,
+            locked: false,
+            layer_type: LayerType::Excel,
+            elements: Vec::new(),
+            spreadsheet: Some(spreadsheet),
+        };
+        let id = layer.id;
+        state.page_mut().layers.push(layer);
+        state.active_layer = state.page().layers.len() - 1;
+        state.sync_spreadsheet_ui();
+        state.push_history(HistoryEntry::LayerAdded {
+            page_id,
+            id,
+            stored: None,
+        });
+        state.dirty = true;
+        drop(state);
+        self.emit_layer_changed();
+        self.schedule_autosave();
+        self.area.queue_draw();
+        Ok(())
+    }
+
+    pub fn export_active_spreadsheet(&self, path: &Path) -> Result<(), DocumentError> {
+        let state = self.state.borrow();
+        let layer = state.active_layer();
+        let Some(spreadsheet) = &layer.spreadsheet else {
+            return Err(DocumentError::Invalid(
+                "the active layer is not a spreadsheet".to_owned(),
+            ));
+        };
+        spreadsheet.export_xlsx(path)
     }
 
     pub fn remove_active_layer(&self) -> bool {
@@ -604,8 +760,10 @@ impl Canvas {
         });
         state.active_layer = index.min(state.page().layers.len() - 1);
         state.selection.clear();
+        state.sync_spreadsheet_ui();
         state.dirty = true;
         drop(state);
+        self.emit_layer_changed();
         self.schedule_autosave();
         self.area.queue_draw();
         true
@@ -715,6 +873,9 @@ impl Canvas {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if matches!(extension.as_str(), "xlsx" | "xlsm" | "xls" | "ods") {
+            return self.import_spreadsheet(path);
+        }
         let (kind, media_type) = match extension.as_str() {
             "png" => (MediaKind::Image, "image/png"),
             "jpg" | "jpeg" => (MediaKind::Image, "image/jpeg"),
@@ -723,7 +884,8 @@ impl Canvas {
             "pdf" => (MediaKind::Pdf, "application/pdf"),
             _ => {
                 return Err(DocumentError::Invalid(
-                    "supported imports are PNG, JPEG, WebP, GIF, and PDF".to_owned(),
+                    "supported imports are PNG, JPEG, WebP, GIF, PDF, and Excel spreadsheets"
+                        .to_owned(),
                 ));
             }
         };
@@ -876,6 +1038,15 @@ impl Canvas {
         callback(self.zoom_percent());
     }
 
+    pub fn connect_layer_changed(&self, callback: impl Fn() + 'static) {
+        let callback = Rc::new(callback);
+        self.state
+            .borrow_mut()
+            .layer_listeners
+            .push(callback.clone());
+        callback();
+    }
+
     pub fn connect_busy(&self, callback: impl Fn(bool) + 'static) {
         self.state
             .borrow_mut()
@@ -885,6 +1056,10 @@ impl Canvas {
 
     fn emit_view_changed(&self) {
         emit_view_changed(&self.state);
+    }
+
+    fn emit_layer_changed(&self) {
+        emit_layer_changed(&self.state);
     }
 }
 
@@ -920,6 +1095,189 @@ impl CanvasState {
         let page = self.active_page;
         let layer = self.active_layer;
         &mut self.notebook.pages[page].layers[layer]
+    }
+
+    fn active_spreadsheet_mut(&mut self) -> Option<&mut SpreadsheetLayer> {
+        self.active_layer_mut().spreadsheet.as_mut()
+    }
+
+    fn sync_spreadsheet_ui(&mut self) {
+        self.spreadsheet_editing = false;
+        if self.active_layer().is_excel() {
+            if self.spreadsheet_selection.is_none() {
+                self.spreadsheet_selection = Some(CellAddress::default());
+            }
+            if let (Some(spreadsheet), Some(address)) = (
+                self.active_layer().spreadsheet.as_ref(),
+                self.spreadsheet_selection,
+            ) {
+                self.spreadsheet_edit_buffer =
+                    spreadsheet.get_raw(address).unwrap_or("").to_owned();
+            } else {
+                self.spreadsheet_edit_buffer.clear();
+            }
+        } else {
+            self.spreadsheet_edit_buffer.clear();
+        }
+    }
+
+    fn handle_spreadsheet_click(&mut self, point: Point) -> bool {
+        if self.active_layer().spreadsheet.is_none() {
+            return false;
+        }
+        if let Some(sheet_index) = self
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .and_then(|sheet| sheet.tab_hit_test(point))
+        {
+            if let Some(spreadsheet) = self.active_spreadsheet_mut() {
+                spreadsheet.active_sheet = sheet_index;
+            }
+            self.sync_spreadsheet_ui();
+            return true;
+        }
+        let Some(address) = self
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .and_then(|sheet| sheet.hit_test(point))
+        else {
+            return false;
+        };
+        let same_cell = self.spreadsheet_selection == Some(address);
+        self.spreadsheet_selection = Some(address);
+        if self.spreadsheet_editing && same_cell {
+            let value = self.spreadsheet_edit_buffer.clone();
+            self.commit_spreadsheet_cell(address, value);
+        } else {
+            self.spreadsheet_editing = false;
+            self.spreadsheet_edit_buffer = self
+                .active_layer()
+                .spreadsheet
+                .as_ref()
+                .and_then(|sheet| sheet.get_raw(address))
+                .unwrap_or("")
+                .to_owned();
+        }
+        true
+    }
+
+    fn commit_spreadsheet_cell(&mut self, address: CellAddress, value: String) {
+        let page_id = self.page().id;
+        let layer_id = self.active_layer().id;
+        let previous = self
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .and_then(|sheet| sheet.get_raw(address).map(str::to_owned));
+        if previous.as_deref() == Some(value.as_str()) {
+            self.spreadsheet_editing = false;
+            self.sync_spreadsheet_ui();
+            return;
+        }
+        if let Some(spreadsheet) = self.active_spreadsheet_mut() {
+            spreadsheet.set_raw(address, value);
+        }
+        self.spreadsheet_editing = false;
+        self.sync_spreadsheet_ui();
+        self.push_history(HistoryEntry::SpreadsheetCellChanged {
+            page_id,
+            layer_id,
+            address,
+            stored: previous,
+        });
+        self.dirty = true;
+    }
+
+    fn move_spreadsheet_selection(&mut self, row_delta: i32, col_delta: i32) {
+        let Some(current) = self.spreadsheet_selection else {
+            return;
+        };
+        if let Some(next) = current.offset(row_delta, col_delta) {
+            self.spreadsheet_selection = Some(next);
+            self.sync_spreadsheet_ui();
+        }
+    }
+
+    fn handle_spreadsheet_key(&mut self, key: &str) -> bool {
+        if !self.active_layer().is_excel() || self.active_layer().locked {
+            return false;
+        }
+        match key {
+            "Return" | "KP_Enter" => {
+                if self.spreadsheet_editing
+                    && let Some(address) = self.spreadsheet_selection
+                {
+                    let value = self.spreadsheet_edit_buffer.clone();
+                    self.commit_spreadsheet_cell(address, value);
+                } else {
+                    self.move_spreadsheet_selection(1, 0);
+                }
+                true
+            }
+            "Tab" => {
+                if self.spreadsheet_editing
+                    && let Some(address) = self.spreadsheet_selection
+                {
+                    let value = self.spreadsheet_edit_buffer.clone();
+                    self.commit_spreadsheet_cell(address, value);
+                }
+                self.move_spreadsheet_selection(0, 1);
+                true
+            }
+            "Escape" => {
+                self.spreadsheet_editing = false;
+                self.sync_spreadsheet_ui();
+                true
+            }
+            "Up" => {
+                if !self.spreadsheet_editing {
+                    self.move_spreadsheet_selection(-1, 0);
+                    return true;
+                }
+                false
+            }
+            "Down" => {
+                if !self.spreadsheet_editing {
+                    self.move_spreadsheet_selection(1, 0);
+                    return true;
+                }
+                false
+            }
+            "Left" => {
+                if !self.spreadsheet_editing {
+                    self.move_spreadsheet_selection(0, -1);
+                    return true;
+                }
+                false
+            }
+            "Right" => {
+                if !self.spreadsheet_editing {
+                    self.move_spreadsheet_selection(0, 1);
+                    return true;
+                }
+                false
+            }
+            "Delete" | "BackSpace" if !self.spreadsheet_editing => {
+                if let Some(address) = self.spreadsheet_selection {
+                    self.commit_spreadsheet_cell(address, String::new());
+                }
+                true
+            }
+            "F2" => {
+                self.spreadsheet_editing = true;
+                true
+            }
+            text if text.len() == 1 => {
+                self.spreadsheet_editing = true;
+                if !self.spreadsheet_edit_buffer.is_empty() || text != " " {
+                    self.spreadsheet_edit_buffer.push_str(text);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn rebuild_image_cache(&mut self) {
@@ -1016,6 +1374,13 @@ impl CanvasState {
     }
 
     fn delete_selection(&mut self) -> usize {
+        if self.active_layer().is_excel() {
+            if let Some(address) = self.spreadsheet_selection {
+                self.commit_spreadsheet_cell(address, String::new());
+                return 1;
+            }
+            return 0;
+        }
         if self.selection.is_empty() {
             return 0;
         }
@@ -1158,6 +1523,12 @@ impl CanvasState {
         }
 
         let world = self.screen_to_world(screen);
+        if self.active_layer().is_excel() && !self.active_layer().locked {
+            if self.handle_spreadsheet_click(world) {
+                self.dirty = true;
+            }
+            return;
+        }
         let effective_tool = if eraser_tip { Tool::Eraser } else { self.tool };
         match effective_tool {
             Tool::Select => {
@@ -1181,7 +1552,7 @@ impl CanvasState {
                 }
             }
             Tool::Pen | Tool::Highlighter => {
-                if self.active_layer().locked {
+                if self.active_layer().locked || self.active_layer().is_excel() {
                     return;
                 }
                 let mut style = self.style.clone();
@@ -1204,7 +1575,7 @@ impl CanvasState {
                 self.interaction = Some(Interaction::Erase);
             }
             Tool::Text => {
-                if self.active_layer().locked {
+                if self.active_layer().locked || self.active_layer().is_excel() {
                     return;
                 }
                 let text = self.pending_text.trim();
@@ -1221,7 +1592,7 @@ impl CanvasState {
                 self.interaction = None;
             }
             Tool::Shape => {
-                if self.active_layer().locked {
+                if self.active_layer().locked || self.active_layer().is_excel() {
                     return;
                 }
                 self.interaction = Some(Interaction::Shape {
@@ -1230,7 +1601,7 @@ impl CanvasState {
                 });
             }
             Tool::Connector => {
-                if self.active_layer().locked {
+                if self.active_layer().locked || self.active_layer().is_excel() {
                     return;
                 }
                 let start = self.page().snap_endpoint(world, 18.0 / self.zoom);
@@ -1364,6 +1735,9 @@ impl CanvasState {
     }
 
     fn add_element(&mut self, element: Element) {
+        if !self.active_layer().is_canvas() {
+            return;
+        }
         let id = element.id();
         let page_id = self.page().id;
         let layer_id = self.active_layer().id;
@@ -1507,6 +1881,35 @@ impl CanvasState {
                 }
                 self.active_layer = (*index).min(page.layers.len() - 1);
             }
+            HistoryEntry::SpreadsheetCellChanged {
+                page_id,
+                layer_id,
+                address,
+                stored,
+            } => {
+                let Some(page) = self
+                    .notebook
+                    .pages
+                    .iter_mut()
+                    .find(|page| page.id == *page_id)
+                else {
+                    return;
+                };
+                let Some(layer) = page.layers.iter_mut().find(|layer| layer.id == *layer_id) else {
+                    return;
+                };
+                let Some(spreadsheet) = layer.spreadsheet.as_mut() else {
+                    return;
+                };
+                let current = spreadsheet.get_raw(*address).map(str::to_owned);
+                if let Some(previous) = stored.take() {
+                    spreadsheet.set_raw(*address, previous);
+                } else if let Some(value) = current {
+                    *stored = Some(value);
+                    spreadsheet.set_raw(*address, String::new());
+                }
+                self.sync_spreadsheet_ui();
+            }
         }
         self.selection.clear();
     }
@@ -1575,6 +1978,13 @@ fn emit_view_changed(state: &Rc<RefCell<CanvasState>>) {
     };
     for listener in listeners {
         listener(percent);
+    }
+}
+
+fn emit_layer_changed(state: &Rc<RefCell<CanvasState>>) {
+    let listeners = state.borrow().layer_listeners.clone();
+    for listener in listeners {
+        listener();
     }
 }
 
@@ -1812,6 +2222,39 @@ fn attach_view_controls(area: &gtk::DrawingArea, state: &Rc<RefCell<CanvasState>
     area.add_controller(pinch);
 }
 
+fn attach_keyboard_input(area: &gtk::DrawingArea, state: &Rc<RefCell<CanvasState>>) {
+    let controller = gtk::EventControllerKey::new();
+    controller.connect_key_pressed({
+        let state = state.clone();
+        let area = area.clone();
+        move |_, key, _, modifier| {
+            if modifier.contains(gdk::ModifierType::CONTROL_MASK)
+                || modifier.contains(gdk::ModifierType::ALT_MASK)
+            {
+                return glib::Propagation::Proceed;
+            }
+            let key_name = key.name().unwrap_or_default();
+            let handled = if let Some(ch) = key.to_unicode() {
+                if !ch.is_control() && ch != '\n' && ch != '\t' {
+                    state.borrow_mut().handle_spreadsheet_key(&ch.to_string())
+                } else {
+                    false
+                }
+            } else {
+                false
+            } || state.borrow_mut().handle_spreadsheet_key(&key_name);
+            if handled {
+                schedule_autosave(&state);
+                area.queue_draw();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    area.add_controller(controller);
+}
+
 fn draw_canvas(context: &Context, width: i32, height: i32, state: &CanvasState) {
     set_source(context, state.page().canvas.background);
     let _ = context.paint();
@@ -1830,6 +2273,26 @@ fn draw_canvas(context: &Context, width: i32, height: i32, state: &CanvasState) 
         draw_grid(context, state, viewport);
     }
 
+    for layer in state.page().visible_layers() {
+        if let Some(spreadsheet) = &layer.spreadsheet
+            && spreadsheet
+                .bounds
+                .intersects(viewport.expand(48.0 / state.zoom))
+        {
+            let selected = if state.active_layer().id == layer.id {
+                state.spreadsheet_selection
+            } else {
+                None
+            };
+            let editing = state.active_layer().id == layer.id && state.spreadsheet_editing;
+            draw_spreadsheet(
+                context,
+                spreadsheet,
+                selected,
+                editing.then_some(state.spreadsheet_edit_buffer.as_str()),
+            );
+        }
+    }
     for element in state.page().visible_elements() {
         if element
             .bounds()
@@ -2091,6 +2554,179 @@ fn rounded_rect(context: &Context, bounds: Rect, radius: f32) {
         270.0_f64.to_radians(),
     );
     context.close_path();
+}
+
+fn draw_spreadsheet(
+    context: &Context,
+    spreadsheet: &SpreadsheetLayer,
+    selected: Option<CellAddress>,
+    editing_text: Option<&str>,
+) {
+    use crate::spreadsheet::{HEADER_HEIGHT, HEADER_WIDTH, TAB_HEIGHT, column_label};
+    let sheet = spreadsheet.active_sheet();
+    let (max_row, max_col) = spreadsheet.used_range();
+    let rows = max_row.max(12) + 1;
+    let cols = max_col.max(6) + 1;
+    let bounds = spreadsheet.bounds;
+
+    context.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    context.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        bounds.height as f64,
+    );
+    let _ = context.fill_preserve();
+    context.set_source_rgba(0.72, 0.75, 0.80, 1.0);
+    context.set_line_width(1.0);
+    let _ = context.stroke();
+
+    context.set_source_rgba(0.94, 0.95, 0.97, 1.0);
+    context.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        HEADER_HEIGHT as f64,
+    );
+    let _ = context.fill();
+    context.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        HEADER_WIDTH as f64,
+        bounds.height as f64,
+    );
+    let _ = context.fill();
+
+    context.select_font_face(
+        "Sans",
+        gtk::cairo::FontSlant::Normal,
+        gtk::cairo::FontWeight::Normal,
+    );
+    context.set_font_size(11.0);
+    context.set_source_rgba(0.35, 0.38, 0.44, 1.0);
+
+    let mut x = bounds.x + HEADER_WIDTH;
+    for col in 0..cols {
+        let width = spreadsheet.column_width(sheet, col);
+        let label = column_label(col);
+        context.move_to(
+            (x + width / 2.0 - 4.0) as f64,
+            (bounds.y + HEADER_HEIGHT / 2.0 + 4.0) as f64,
+        );
+        let _ = context.show_text(&label);
+        x += width;
+    }
+
+    let mut y = bounds.y + HEADER_HEIGHT;
+    for row in 0..rows {
+        let height = spreadsheet.row_height(sheet, row);
+        context.move_to(
+            (bounds.x + HEADER_WIDTH / 2.0 - 4.0) as f64,
+            (y + height / 2.0 + 4.0) as f64,
+        );
+        let _ = context.show_text(&(row + 1).to_string());
+        y += height;
+    }
+
+    if spreadsheet.show_grid_lines {
+        context.set_source_rgba(0.86, 0.88, 0.91, 1.0);
+        context.set_line_width(0.5);
+        let mut x = bounds.x + HEADER_WIDTH;
+        for col in 0..=cols {
+            let _ = col;
+            context.move_to(x as f64, (bounds.y + HEADER_HEIGHT) as f64);
+            context.line_to(x as f64, (bounds.y + bounds.height - TAB_HEIGHT) as f64);
+            x += if col < cols {
+                spreadsheet.column_width(sheet, col)
+            } else {
+                0.0
+            };
+        }
+        let mut y = bounds.y + HEADER_HEIGHT;
+        for row in 0..=rows {
+            let _ = row;
+            context.move_to((bounds.x + HEADER_WIDTH) as f64, y as f64);
+            context.line_to((bounds.x + bounds.width) as f64, y as f64);
+            y += if row < rows {
+                spreadsheet.row_height(sheet, row)
+            } else {
+                0.0
+            };
+        }
+        let _ = context.stroke();
+    }
+
+    context.set_font_size(12.0);
+    let mut y = bounds.y + HEADER_HEIGHT;
+    for row in 0..rows {
+        let height = spreadsheet.row_height(sheet, row);
+        let mut x = bounds.x + HEADER_WIDTH;
+        for col in 0..cols {
+            let width = spreadsheet.column_width(sheet, col);
+            let address = CellAddress { row, col };
+            let is_selected = selected == Some(address);
+            if is_selected {
+                context.set_source_rgba(0.82, 0.90, 1.0, 1.0);
+                context.rectangle(x as f64, y as f64, width as f64, height as f64);
+                let _ = context.fill();
+                context.set_source_rgba(0.12, 0.38, 0.88, 1.0);
+                context.set_line_width(2.0);
+                context.rectangle(x as f64, y as f64, width as f64, height as f64);
+                let _ = context.stroke();
+            }
+            let text = if is_selected {
+                editing_text
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| spreadsheet.display_text(address))
+            } else {
+                spreadsheet.display_text(address)
+            };
+            if !text.is_empty() {
+                context.set_source_rgba(0.12, 0.14, 0.18, 1.0);
+                context.move_to((x + 6.0) as f64, (y + height / 2.0 + 4.0) as f64);
+                let clipped = if text.len() > 24 {
+                    format!("{}…", &text[..23])
+                } else {
+                    text
+                };
+                let _ = context.show_text(&clipped);
+            }
+            x += width;
+        }
+        y += height;
+    }
+
+    let tab_top = bounds.y + bounds.height - TAB_HEIGHT;
+    context.set_source_rgba(0.90, 0.92, 0.95, 1.0);
+    context.rectangle(
+        bounds.x as f64,
+        tab_top as f64,
+        bounds.width as f64,
+        TAB_HEIGHT as f64,
+    );
+    let _ = context.fill();
+
+    let mut tab_x = bounds.x + 8.0;
+    for (index, sheet_tab) in spreadsheet.sheets.iter().enumerate() {
+        let width = (sheet_tab.name.len() as f32 * 7.0 + 24.0).max(72.0);
+        let active = index == spreadsheet.active_sheet;
+        context.set_source_rgba(
+            if active { 1.0 } else { 0.96 },
+            if active { 1.0 } else { 0.97 },
+            if active { 1.0 } else { 0.98 },
+            1.0,
+        );
+        context.rectangle(tab_x as f64, (tab_top + 4.0) as f64, width as f64, 18.0);
+        let _ = context.fill_preserve();
+        context.set_source_rgba(0.72, 0.75, 0.80, 1.0);
+        context.set_line_width(1.0);
+        let _ = context.stroke();
+        context.set_source_rgba(0.22, 0.24, 0.30, 1.0);
+        context.set_font_size(11.0);
+        context.move_to((tab_x + 10.0) as f64, (tab_top + 16.0) as f64);
+        let _ = context.show_text(&sheet_tab.name);
+        tab_x += width + 4.0;
+    }
 }
 
 fn draw_element(context: &Context, element: &Element, image_cache: &HashMap<Uuid, Pixbuf>) {

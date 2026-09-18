@@ -2,7 +2,9 @@ use base64::Engine;
 use inkstone::document::{
     Color, Document, Element, MediaElement, MediaKind, Point, Rect, TextNote,
 };
-use inkstone::notebook::{Asset, Layer, NOTEBOOK_FORMAT, NOTEBOOK_VERSION, Notebook, NotebookPage};
+use inkstone::notebook::{
+    Asset, Layer, LayerType, NOTEBOOK_FORMAT, NOTEBOOK_VERSION, Notebook, NotebookPage,
+};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -32,7 +34,9 @@ fn notebook_round_trip_preserves_pages_layers_and_search() {
             name: "Equations".to_owned(),
             visible: true,
             locked: true,
+            layer_type: LayerType::Canvas,
             elements: vec![text("torque curve", 40.0)],
+            spreadsheet: None,
         }],
     });
     let directory = tempdir().unwrap();
