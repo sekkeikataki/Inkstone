@@ -1383,6 +1383,13 @@ fn install_actions(
             status.whisper("Opened library in Files");
         }
     });
+    add_action(window, "move-notebook", {
+        let window = window.clone();
+        let canvas = canvas.clone();
+        let status = status.clone();
+        let navigator = navigator.clone();
+        move || prompt_move_notebook(&window, &canvas, &navigator, &status)
+    });
     add_action(window, "add-to-library", {
         let canvas = canvas.clone();
         let navigator = navigator.clone();
