@@ -81,10 +81,15 @@ the field keep loading.
   electrical, and mechanical primitives.
 - `connector`: start/end points, orthogonal route points, style, label, and optional attachments.
 - `media`: bounds, searchable alt text/caption, semantic `image`/`pdf` kind, and an `asset_id`.
+  Imported PDFs are rasterized to image assets (one notebook page per PDF page, locked background
+  plus a notes layer) when `pdftoppm` is available.
 
 Assets are stored once in the top-level `assets` array with UUID, filename, MIME type, and standard
 base64 bytes. This keeps element relationships small and lets multiple future media frames reference
 one payload. Current imports are capped at 64 MiB.
+
+`frozen_rows` / `frozen_cols` pin worksheet panes from the active cell (Excel freeze-panes). SVG and
+PDF export draw the used cell range plus frozen bands, not the empty 10×10 padding of a new sheet.
 
 An attachment is explicit:
 

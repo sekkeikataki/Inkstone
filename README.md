@@ -16,13 +16,15 @@ runtime, Electron layer, or network service.
   left tool rail with contextual color/width options, live zoom, canvas-first chrome that slides
   away while drawing, and short page/selection/empty-state motion
 - Typed note placement and cross-page text/label/spreadsheet search
-- Selection, lasso selection, drag-to-move, duplicate, delete, and relationship-aware connectors
-- Pen colors, pressure ink, translucent highlighter, and whole-object eraser
+- Selection, lasso selection, drag-to-move, resize/rotate handles, duplicate, delete, and
+  relationship-aware connectors
+- Pen colors, pressure ink, translucent highlighter, and a stroke-splitting eraser
 - Rectangle, ellipse, resistor, capacitor, ground, motor, gear, bearing, spring, and beam symbols
 - Orthogonal connectors that snap to semantic anchors and retain those relationships
-- Embedded PNG/JPEG/WebP/GIF images and portable embedded PDF attachment cards
+- Embedded PNG/JPEG/WebP/GIF images and PDF pages rasterized onto locked, annotatable canvas layers
 - Undo/redo, debounced autosave after the first manual save, protected unsaved close/new/open,
   native file dialogs, SVG page export, and multi-page PDF export
+- System clipboard: worksheet TSV/HTML copy, and sketch copy as Inkstone JSON plus a PNG snapshot
 - Open, pretty-printed `.inkstone` JSON with UUIDs, text, pressure points, shapes, labels, connector
   routes, and attached element/anchor IDs
 
@@ -31,7 +33,7 @@ runtime, Electron layer, or network service.
 Install build/runtime dependencies:
 
 ```bash
-sudo pacman -S --needed rustup gtk4 libadwaita pkgconf xdg-desktop-portal-gtk
+sudo pacman -S --needed rustup gtk4 libadwaita pkgconf xdg-desktop-portal-gtk poppler
 rustup toolchain install 1.98.1
 ```
 
@@ -57,9 +59,11 @@ contents of the note field at the clicked position. Shape/connector labels and i
 the chip above the canvas. Click a page or layer name in the sidebar to rename it. The layer add
 menu can insert a notes layer or a spreadsheet layer. Spreadsheet layers spawn as a 10×10
 workbook on the canvas: click cells, type values or `=` formulas, use the name box and formula bar,
-Enter/Tab to grow past the edge, drag the bottom-right handle to resize the grid, +Col/+Row to add
-blocks of cells, and drag the green title bar to reposition. Column and row headers select,
-resize, and fill like a worksheet.
+Enter/Tab to grow past the edge, drag any corner handle to resize the grid, +Col/+Row to add
+blocks of cells, Freeze to pin rows/columns from the active cell, and drag the green title bar to
+reposition. Column and row headers select, resize, and fill like a worksheet. Copy places TSV and
+HTML on the system clipboard; print and SVG/PDF export use the used cell range instead of empty
+padding.
 
 | Action | Input |
 | --- | --- |
@@ -69,6 +73,7 @@ resize, and fill like a worksheet.
 | Tablet erase | Flip to an eraser tip when GTK reports one |
 | Select/lasso and move | Select tool, then click/drag or drag an empty region |
 | Duplicate/delete selection | Ctrl+D / Delete (on a sheet: fill down / clear cells) |
+| Copy/cut/paste | Ctrl+C / Ctrl+X / Ctrl+V (sheet TSV/HTML or sketch image) |
 | Search | Ctrl+F, then Enter for the next match |
 | Import image/PDF | Ctrl+I, or File → Import Image or PDF |
 | Save/open | Ctrl+S / Ctrl+O |
@@ -92,12 +97,9 @@ cargo build --release
 
 ## First-version limitations
 
-- No object resize/rotation handles, rich-text spans, handwriting recognition, audio recording,
-  collaboration, or cloud sync yet. Spreadsheet layers cover Excel-compatible formulas, formatting,
-  sheets, fill, and sort, but not pivot tables, charts, or VBA.
-- Erasing removes the topmost whole object under the tip rather than splitting strokes.
-- Imported PDFs are embedded portable attachment cards; rasterized page annotation is not yet
-  available. Imported images render directly and remain embedded in the notebook.
+- No rich-text spans, handwriting recognition, audio recording, collaboration, or cloud sync yet.
+  Spreadsheet layers cover Excel-compatible formulas, formatting, sheets, fill, freeze panes, and
+  sort, but not pivot tables, charts, or VBA.
 - Palm rejection and device calibration are delegated to GTK/GDK, libinput, and the compositor.
 - Native file dialogs use the desktop FileChooser portal when one is advertised. Minimal window
   manager sessions must run a working portal backend such as `xdg-desktop-portal-gtk`.
@@ -106,5 +108,7 @@ cargo build --release
 - Rendering scans element bounds before drawing. Viewport culling keeps sparse documents cheap,
   but a spatial index will be needed for very dense documents above roughly 10,000 objects.
 - Version 1 documents are validated strictly; there is no migration path for future versions yet.
+- PDF annotation rasterizes each page with `pdftoppm` (Poppler). If Poppler is missing, Inkstone
+  still embeds a portable PDF attachment card.
 
 Inkstone is independent software and does not use third-party notebook branding or assets.

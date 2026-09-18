@@ -40,6 +40,24 @@ impl Point {
     pub fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite()
     }
+
+    pub fn scale_about(self, pivot: Self, sx: f32, sy: f32) -> Self {
+        Self::new(
+            pivot.x + (self.x - pivot.x) * sx,
+            pivot.y + (self.y - pivot.y) * sy,
+        )
+    }
+
+    pub fn rotate_about(self, center: Self, degrees: f32) -> Self {
+        let radians = degrees.to_radians();
+        let (sin, cos) = radians.sin_cos();
+        let dx = self.x - center.x;
+        let dy = self.y - center.y;
+        Self::new(
+            center.x + dx * cos - dy * sin,
+            center.y + dx * sin + dy * cos,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -107,6 +125,21 @@ impl Rect {
             && self.height.is_finite()
             && self.width >= 0.0
             && self.height >= 0.0
+    }
+
+    pub fn scale_about(self, pivot: Point, sx: f32, sy: f32) -> Self {
+        let a = Point::new(self.x, self.y).scale_about(pivot, sx, sy);
+        let b = Point::new(self.x + self.width, self.y + self.height).scale_about(pivot, sx, sy);
+        Self::from_points(a, b)
+    }
+
+    pub fn corners(self) -> [Point; 4] {
+        [
+            Point::new(self.x, self.y),
+            Point::new(self.x + self.width, self.y),
+            Point::new(self.x, self.y + self.height),
+            Point::new(self.x + self.width, self.y + self.height),
+        ]
     }
 }
 
@@ -221,6 +254,140 @@ pub struct Stroke {
     pub kind: StrokeKind,
     pub style: StrokeStyle,
     pub points: Vec<StrokePoint>,
+}
+
+impl Stroke {
+    pub fn erase_disk(&self, center: Point, radius: f32) -> Vec<Stroke> {
+        if self.points.len() < 2 || !radius.is_finite() || radius <= 0.0 {
+            return vec![self.clone()];
+        }
+        let mut fragments = Vec::new();
+        let mut current: Vec<StrokePoint> = Vec::new();
+        for pair in self.points.windows(2) {
+            let start = pair[0];
+            let end = pair[1];
+            let pieces = clip_segment_outside_disk(start, end, center, radius);
+            for (a, b) in &pieces {
+                if current
+                    .last()
+                    .is_none_or(|last| last.point().distance_to(a.point()) > 0.02)
+                {
+                    push_stroke_fragment(&mut fragments, self, std::mem::take(&mut current));
+                }
+                if current.is_empty() {
+                    current.push(*a);
+                }
+                current.push(*b);
+            }
+            if pieces.is_empty() {
+                push_stroke_fragment(&mut fragments, self, std::mem::take(&mut current));
+            }
+        }
+        push_stroke_fragment(&mut fragments, self, current);
+        fragments
+    }
+}
+
+fn push_stroke_fragment(fragments: &mut Vec<Stroke>, source: &Stroke, points: Vec<StrokePoint>) {
+    if points.len() < 2 {
+        return;
+    }
+    fragments.push(Stroke {
+        id: Uuid::new_v4(),
+        kind: source.kind,
+        style: source.style.clone(),
+        points,
+    });
+}
+
+fn clip_segment_outside_disk(
+    start: StrokePoint,
+    end: StrokePoint,
+    center: Point,
+    radius: f32,
+) -> Vec<(StrokePoint, StrokePoint)> {
+    let a = start.point();
+    let b = end.point();
+    let da = a.distance_to(center);
+    let db = b.distance_to(center);
+    let hits = segment_circle_hits(a, b, center, radius);
+    match (da >= radius, db >= radius, hits.as_slice()) {
+        (true, true, []) => vec![(start, end)],
+        (true, true, [_]) => vec![(start, end)],
+        (true, true, [t0, t1, ..]) => {
+            let first = interpolate_stroke(start, end, (*t0).min(*t1));
+            let second = interpolate_stroke(start, end, (*t0).max(*t1));
+            let mut pieces = Vec::new();
+            if a.distance_to(first.point()) > 0.02 {
+                pieces.push((start, first));
+            }
+            if second.point().distance_to(b) > 0.02 {
+                pieces.push((second, end));
+            }
+            pieces
+        }
+        (true, false, hits) => hits
+            .first()
+            .copied()
+            .map(|t| {
+                let mid = interpolate_stroke(start, end, t);
+                if a.distance_to(mid.point()) > 0.02 {
+                    vec![(start, mid)]
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default(),
+        (false, true, hits) => hits
+            .last()
+            .copied()
+            .map(|t| {
+                let mid = interpolate_stroke(start, end, t);
+                if mid.point().distance_to(b) > 0.02 {
+                    vec![(mid, end)]
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default(),
+        (false, false, _) => Vec::new(),
+    }
+}
+
+fn interpolate_stroke(start: StrokePoint, end: StrokePoint, t: f32) -> StrokePoint {
+    let t = t.clamp(0.0, 1.0);
+    StrokePoint {
+        x: start.x + (end.x - start.x) * t,
+        y: start.y + (end.y - start.y) * t,
+        pressure: (start.pressure + (end.pressure - start.pressure) * t).clamp(0.0, 1.0),
+    }
+}
+
+fn segment_circle_hits(a: Point, b: Point, center: Point, radius: f32) -> Vec<f32> {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let fx = a.x - center.x;
+    let fy = a.y - center.y;
+    let aa = dx * dx + dy * dy;
+    if aa < f32::EPSILON {
+        return Vec::new();
+    }
+    let bb = 2.0 * (fx * dx + fy * dy);
+    let cc = fx * fx + fy * fy - radius * radius;
+    let discriminant = bb * bb - 4.0 * aa * cc;
+    if discriminant < 0.0 {
+        return Vec::new();
+    }
+    let sqrt = discriminant.sqrt();
+    let mut hits = Vec::new();
+    for root in [(-bb - sqrt) / (2.0 * aa), (-bb + sqrt) / (2.0 * aa)] {
+        if root.is_finite() && (0.0..=1.0).contains(&root) {
+            hits.push(root);
+        }
+    }
+    hits.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    hits.dedup_by(|left, right| (*left - *right).abs() < 1e-5);
+    hits
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -477,6 +644,83 @@ impl Element {
             Self::Media(media) => {
                 media.bounds.x += delta.x;
                 media.bounds.y += delta.y;
+            }
+        }
+    }
+
+    pub fn scale_about(&mut self, pivot: Point, sx: f32, sy: f32) {
+        let sx = if sx.is_finite() { sx } else { 1.0 };
+        let sy = if sy.is_finite() { sy } else { 1.0 };
+        match self {
+            Self::Stroke(stroke) => {
+                for point in &mut stroke.points {
+                    let scaled = point.point().scale_about(pivot, sx, sy);
+                    point.x = scaled.x;
+                    point.y = scaled.y;
+                }
+                stroke.style.width = (stroke.style.width * sx.abs().max(sy.abs())).max(0.4);
+            }
+            Self::Text(text) => {
+                text.origin = text.origin.scale_about(pivot, sx, sy);
+                text.font_size = (text.font_size * sy.abs().max(0.15)).max(6.0);
+                if let Some(width) = text.max_width.as_mut() {
+                    *width = (*width * sx.abs()).max(12.0);
+                }
+            }
+            Self::Shape(shape) => {
+                let scaled = shape.bounds.scale_about(pivot, sx, sy);
+                if scaled.width >= 8.0 && scaled.height >= 8.0 {
+                    shape.bounds = scaled;
+                }
+            }
+            Self::Connector(connector) => {
+                connector.start.point = connector.start.point.scale_about(pivot, sx, sy);
+                connector.end.point = connector.end.point.scale_about(pivot, sx, sy);
+                for point in &mut connector.route {
+                    *point = point.scale_about(pivot, sx, sy);
+                }
+            }
+            Self::Media(media) => {
+                let scaled = media.bounds.scale_about(pivot, sx, sy);
+                if scaled.width >= 8.0 && scaled.height >= 8.0 {
+                    media.bounds = scaled;
+                }
+            }
+        }
+    }
+
+    pub fn rotate_about(&mut self, center: Point, degrees: f32) {
+        if !degrees.is_finite() || degrees.abs() < 0.01 {
+            return;
+        }
+        match self {
+            Self::Stroke(stroke) => {
+                for point in &mut stroke.points {
+                    let rotated = point.point().rotate_about(center, degrees);
+                    point.x = rotated.x;
+                    point.y = rotated.y;
+                }
+            }
+            Self::Text(text) => {
+                text.origin = text.origin.rotate_about(center, degrees);
+            }
+            Self::Shape(shape) => {
+                let rotated = shape.bounds.center().rotate_about(center, degrees);
+                shape.bounds.x = rotated.x - shape.bounds.width / 2.0;
+                shape.bounds.y = rotated.y - shape.bounds.height / 2.0;
+                shape.rotation_degrees = (shape.rotation_degrees + degrees).rem_euclid(360.0);
+            }
+            Self::Connector(connector) => {
+                connector.start.point = connector.start.point.rotate_about(center, degrees);
+                connector.end.point = connector.end.point.rotate_about(center, degrees);
+                for point in &mut connector.route {
+                    *point = point.rotate_about(center, degrees);
+                }
+            }
+            Self::Media(media) => {
+                let rotated = media.bounds.center().rotate_about(center, degrees);
+                media.bounds.x = rotated.x - media.bounds.width / 2.0;
+                media.bounds.y = rotated.y - media.bounds.height / 2.0;
             }
         }
     }

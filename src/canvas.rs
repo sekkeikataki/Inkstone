@@ -5,20 +5,25 @@ use crate::document::{
 use crate::notebook::{Asset, Layer, Notebook, NotebookPage, SearchHit};
 use crate::spreadsheet::address::{CellAddr, CellRange, col_name};
 use crate::spreadsheet::formula::{EvalContext, Value};
-use crate::spreadsheet::{Cell, HAlign, LayerKind, Sheet, Spreadsheet, VAlign};
+use crate::spreadsheet::{Cell, HAlign, LayerKind, Sheet, SheetHandle, Spreadsheet, VAlign};
 use base64::Engine;
+use cairo::ImageSurface;
 use cairo::PdfSurface;
+use gdk_pixbuf::prelude::*;
 use gdk_pixbuf::{Pixbuf, PixbufLoader};
 use gtk::cairo::{Context, LineCap, LineJoin};
 use gtk::gdk;
-use gtk::gdk::prelude::GdkCairoContextExt;
+use gtk::gdk::prelude::*;
+use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -29,6 +34,7 @@ const HISTORY_LIMIT: usize = 256;
 const SELECTION_FLASH_SECS: f32 = 0.28;
 const PAGE_FADE_SECS: f32 = 0.26;
 const EMPTY_HINT_SECS: f32 = 0.7;
+const CLIPBOARD_MIME: &str = "application/x-inkstone-elements+json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -87,6 +93,7 @@ struct CanvasState {
     sheet_editing: Option<(CellAddr, String)>,
     sheet_listeners: Vec<Rc<dyn Fn()>>,
     sheet_clipboard: Option<(CellAddr, Vec<(CellAddr, Cell)>)>,
+    element_clipboard: Option<ElementClipboard>,
 }
 
 enum Interaction {
@@ -120,6 +127,8 @@ enum Interaction {
         origin_before: Point,
     },
     SheetGrow {
+        handle: SheetHandle,
+        origin_before: Point,
         cols_before: u32,
         rows_before: u32,
     },
@@ -137,6 +146,30 @@ enum Interaction {
         source: CellRange,
         current: CellAddr,
     },
+    TransformSelection {
+        handle: HandleKind,
+        start: Point,
+        bounds: Rect,
+        originals: Vec<(Uuid, Element)>,
+        before: Vec<ElementSlot>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandleKind {
+    Nw,
+    Ne,
+    Sw,
+    Se,
+    Rotate,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ElementClipboard {
+    format: String,
+    version: u32,
+    elements: Vec<Element>,
+    assets: Vec<Asset>,
 }
 
 enum HistoryEntry {
@@ -218,6 +251,7 @@ impl Default for CanvasState {
             sheet_editing: None,
             sheet_listeners: Vec::new(),
             sheet_clipboard: None,
+            element_clipboard: None,
         }
     }
 }
@@ -391,7 +425,7 @@ impl Canvas {
             context
                 .paint()
                 .map_err(|error| DocumentError::Export(error.to_string()))?;
-            if let Some(bounds) = page.content_bounds() {
+            if let Some(bounds) = page.export_bounds() {
                 let bounds = bounds.expand(24.0);
                 let scale = ((page_width - 48.0) / bounds.width as f64)
                     .min((page_height - 48.0) / bounds.height as f64)
@@ -1118,6 +1152,171 @@ impl Canvas {
         count
     }
 
+    pub fn copy_selection(&self) {
+        let mut state = self.state.borrow_mut();
+        state.copy_active();
+        drop(state);
+        self.publish_system_clipboard();
+    }
+
+    pub fn cut_selection(&self) {
+        let mut state = self.state.borrow_mut();
+        state.copy_active();
+        let _ = if state.active_layer().is_spreadsheet() {
+            state.clear_sheet_selection()
+        } else {
+            state.delete_selection()
+        };
+        drop(state);
+        self.publish_system_clipboard();
+        self.schedule_autosave();
+        self.emit_sheet_changed();
+        self.area.queue_draw();
+    }
+
+    pub fn paste_clipboard(&self) {
+        let use_internal = {
+            let state = self.state.borrow();
+            if state.active_layer().is_spreadsheet() {
+                gdk::Display::default().is_none() && state.sheet_clipboard.is_some()
+            } else {
+                state.element_clipboard.is_some()
+            }
+        };
+        if use_internal {
+            let mut state = self.state.borrow_mut();
+            state.paste_internal();
+            drop(state);
+            self.schedule_autosave();
+            self.emit_sheet_changed();
+            self.area.queue_draw();
+            return;
+        }
+        self.paste_from_system();
+    }
+
+    pub fn freeze_sheet_panes(&self) {
+        let range = self.state.borrow().sheet_range;
+        self.mutate_sheet(|book| {
+            if let Some(range) = range {
+                book.active_mut().freeze_at(range.start);
+            }
+        });
+    }
+
+    pub fn frozen_panes(&self) -> (u32, u32) {
+        self.state
+            .borrow()
+            .active_layer()
+            .spreadsheet
+            .as_ref()
+            .map(|book| (book.active().frozen_rows, book.active().frozen_cols))
+            .unwrap_or((0, 0))
+    }
+
+    fn publish_system_clipboard(&self) {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        let clipboard = display.clipboard();
+        let state = self.state.borrow();
+        if state.active_layer().is_spreadsheet() {
+            if let (Some(range), Some(book)) =
+                (state.sheet_range, state.active_layer().spreadsheet.as_ref())
+            {
+                let tsv = book.active().to_tsv(range);
+                let html = book.active().to_html(range);
+                let text = gdk::ContentProvider::for_bytes(
+                    "text/plain",
+                    &glib::Bytes::from_owned(tsv.into_bytes()),
+                );
+                let html_provider = gdk::ContentProvider::for_bytes(
+                    "text/html",
+                    &glib::Bytes::from_owned(html.into_bytes()),
+                );
+                let provider = gdk::ContentProvider::new_union(&[text, html_provider]);
+                let _ = clipboard.set_content(Some(&provider));
+            }
+            return;
+        }
+        let Some(payload) = state.element_clipboard.as_ref() else {
+            return;
+        };
+        let json = serde_json::to_vec(payload).unwrap_or_default();
+        let json_provider =
+            gdk::ContentProvider::for_bytes(CLIPBOARD_MIME, &glib::Bytes::from_owned(json));
+        if let Some(png) = render_selection_png(&state) {
+            let png_provider =
+                gdk::ContentProvider::for_bytes("image/png", &glib::Bytes::from_owned(png));
+            let provider = gdk::ContentProvider::new_union(&[json_provider, png_provider]);
+            let _ = clipboard.set_content(Some(&provider));
+        } else {
+            let _ = clipboard.set_content(Some(&json_provider));
+        }
+    }
+
+    fn paste_from_system(&self) {
+        let Some(display) = gdk::Display::default() else {
+            let mut state = self.state.borrow_mut();
+            state.paste_internal();
+            drop(state);
+            self.schedule_autosave();
+            self.emit_sheet_changed();
+            self.area.queue_draw();
+            return;
+        };
+        let clipboard = display.clipboard();
+        let canvas = self.clone();
+        if self.state.borrow().active_layer().is_spreadsheet() {
+            clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
+                if let Ok(Some(text)) = result {
+                    let mut state = canvas.state.borrow_mut();
+                    state.paste_sheet_text(text.as_str());
+                    drop(state);
+                    canvas.schedule_autosave();
+                    canvas.emit_sheet_changed();
+                    canvas.area.queue_draw();
+                }
+            });
+            return;
+        }
+        clipboard.read_texture_async(gio::Cancellable::NONE, move |result| {
+            if let Ok(Some(texture)) = result {
+                let path =
+                    std::env::temp_dir().join(format!("inkstone-clip-{}.png", Uuid::new_v4()));
+                if texture.save_to_png(&path).is_ok()
+                    && let Ok(bytes) = fs::read(&path)
+                    && let Ok(pixbuf) = decode_pixbuf(&bytes)
+                {
+                    let _ = fs::remove_file(&path);
+                    let mut state = canvas.state.borrow_mut();
+                    state.paste_pixbuf(pixbuf, "Pasted image");
+                    drop(state);
+                    canvas.schedule_autosave();
+                    canvas.emit_sheet_changed();
+                    canvas.area.queue_draw();
+                    return;
+                }
+                let _ = fs::remove_file(&path);
+            }
+            let canvas = canvas.clone();
+            display
+                .clipboard()
+                .read_text_async(gio::Cancellable::NONE, move |result| {
+                    let mut state = canvas.state.borrow_mut();
+                    if let Ok(Some(text)) = result {
+                        state.paste_plain_text(text.as_str());
+                    } else {
+                        state.paste_internal();
+                    }
+                    drop(state);
+                    canvas.schedule_autosave();
+                    canvas.emit_sheet_changed();
+                    canvas.area.queue_draw();
+                });
+        });
+    }
+
     pub fn find_next(&self, query: &str) -> Option<SearchHit> {
         let mut state = self.state.borrow_mut();
         let hits = state.notebook.search(query);
@@ -1197,17 +1396,20 @@ impl Canvas {
             }
         };
         let bytes = fs::read(path)?;
-        if self.state.borrow().active_layer().is_spreadsheet() {
-            return Err(DocumentError::Invalid(
-                "import images onto a notes layer; spreadsheet layers hold workbooks".to_owned(),
-            ));
-        }
-        let asset_id = Uuid::new_v4();
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("Embedded file")
             .to_owned();
+        if self.state.borrow().active_layer().is_spreadsheet() {
+            return Err(DocumentError::Invalid(
+                "import images onto a notes layer; spreadsheet layers hold workbooks".to_owned(),
+            ));
+        }
+        if kind == MediaKind::Pdf {
+            return self.import_pdf_pages(path, &bytes, &name);
+        }
+        let asset_id = Uuid::new_v4();
         let mut state = self.state.borrow_mut();
         let center = state.screen_to_world(Point::new(
             self.area.width() as f32 / 2.0,
@@ -1250,6 +1452,124 @@ impl Canvas {
         self.schedule_autosave();
         self.area.queue_draw();
         Ok(())
+    }
+
+    fn import_pdf_pages(&self, path: &Path, bytes: &[u8], name: &str) -> Result<(), DocumentError> {
+        let rasters = rasterize_pdf_pages(path)?;
+        if rasters.is_empty() {
+            return self.import_pdf_card(bytes, name);
+        }
+        let mut first_page = true;
+        for (index, (png, width, height)) in rasters.into_iter().enumerate() {
+            if !first_page || !self.page_is_blank() {
+                self.add_page();
+            }
+            first_page = false;
+            let asset_id = Uuid::new_v4();
+            let pixbuf = decode_pixbuf(&png)?;
+            let scale = (960.0 / width as f32).min(720.0 / height as f32).min(1.0);
+            let bounds = Rect {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32 * scale,
+                height: height as f32 * scale,
+            };
+            let mut state = self.state.borrow_mut();
+            state.image_cache.insert(asset_id, pixbuf);
+            state.notebook.assets.push(Asset {
+                id: asset_id,
+                name: format!("{name} · page {}", index + 1),
+                media_type: "image/png".to_owned(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(png),
+            });
+            let page_index = state.active_page;
+            if state.notebook.pages[page_index].layers.is_empty() {
+                state.notebook.pages[page_index]
+                    .layers
+                    .push(Layer::named("Notes"));
+            }
+            let background = Layer {
+                id: Uuid::new_v4(),
+                name: format!("PDF {}", index + 1),
+                visible: true,
+                locked: true,
+                kind: LayerKind::Notes,
+                elements: vec![Element::Media(MediaElement {
+                    id: Uuid::new_v4(),
+                    asset_id,
+                    kind: MediaKind::Image,
+                    bounds,
+                    alt_text: format!("{name} page {}", index + 1),
+                    caption: format!("{name} page {}", index + 1),
+                })],
+                spreadsheet: None,
+            };
+            let background_id = background.id;
+            let page_id = state.notebook.pages[page_index].id;
+            state.notebook.pages[page_index]
+                .layers
+                .insert(0, background);
+            state.active_layer = 1.min(state.notebook.pages[page_index].layers.len() - 1);
+            if state.notebook.pages[page_index].layers.len() == 1 {
+                state.notebook.pages[page_index]
+                    .layers
+                    .push(Layer::named("Notes"));
+                state.active_layer = 1;
+            }
+            state.notebook.pages[page_index].title = format!("{name} {}", index + 1);
+            state.push_history(HistoryEntry::LayerAdded {
+                page_id,
+                id: background_id,
+                stored: None,
+            });
+            state.dirty = true;
+            drop(state);
+        }
+        self.schedule_autosave();
+        self.reset_view();
+        self.area.queue_draw();
+        Ok(())
+    }
+
+    fn import_pdf_card(&self, bytes: &[u8], name: &str) -> Result<(), DocumentError> {
+        let asset_id = Uuid::new_v4();
+        let mut state = self.state.borrow_mut();
+        let center = state.screen_to_world(Point::new(
+            self.area.width() as f32 / 2.0,
+            self.area.height() as f32 / 2.0,
+        ));
+        state.notebook.assets.push(Asset {
+            id: asset_id,
+            name: name.to_owned(),
+            media_type: "application/pdf".to_owned(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        state.add_element(Element::Media(MediaElement {
+            id: Uuid::new_v4(),
+            asset_id,
+            kind: MediaKind::Pdf,
+            bounds: Rect {
+                x: center.x - 180.0,
+                y: center.y - 110.0,
+                width: 360.0,
+                height: 220.0,
+            },
+            alt_text: name.to_owned(),
+            caption: name.to_owned(),
+        }));
+        drop(state);
+        self.schedule_autosave();
+        self.area.queue_draw();
+        Ok(())
+    }
+
+    fn page_is_blank(&self) -> bool {
+        let state = self.state.borrow();
+        state
+            .page()
+            .layers
+            .iter()
+            .all(|layer| layer.elements.is_empty() && layer.spreadsheet.is_none())
     }
 
     pub fn toggle_grid(&self) {
@@ -1504,6 +1824,188 @@ impl CanvasState {
         self.sheet_clipboard = Some((range.start, cells));
     }
 
+    fn copy_active(&mut self) {
+        if self.active_layer().is_spreadsheet() {
+            self.copy_sheet_selection();
+            return;
+        }
+        if self.selection.is_empty() {
+            return;
+        }
+        let selected = self.selection.clone();
+        let elements: Vec<Element> = self
+            .page()
+            .elements()
+            .filter(|element| selected.contains(&element.id()))
+            .cloned()
+            .collect();
+        let mut assets = Vec::new();
+        for element in &elements {
+            if let Element::Media(media) = element
+                && let Some(asset) = self.notebook.asset(media.asset_id).cloned()
+                && !assets
+                    .iter()
+                    .any(|existing: &Asset| existing.id == asset.id)
+            {
+                assets.push(asset);
+            }
+        }
+        self.element_clipboard = Some(ElementClipboard {
+            format: "inkstone.clipboard".to_owned(),
+            version: 1,
+            elements,
+            assets,
+        });
+    }
+
+    fn paste_internal(&mut self) {
+        if self.active_layer().is_spreadsheet() {
+            self.paste_sheet_selection();
+            return;
+        }
+        let Some(payload) = self.element_clipboard.clone() else {
+            return;
+        };
+        self.paste_elements(payload);
+    }
+
+    fn paste_sheet_text(&mut self, text: &str) {
+        self.commit_sheet_edit();
+        if text.trim().is_empty() {
+            return;
+        }
+        let dest = self
+            .sheet_range
+            .map(|range| range.start)
+            .unwrap_or(CellAddr { col: 0, row: 0 });
+        let Some(before) = self.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().paste_tsv(dest, text);
+        }
+        self.push_spreadsheet_history(before);
+        self.dirty = true;
+    }
+
+    fn paste_plain_text(&mut self, text: &str) {
+        if self.active_layer().is_spreadsheet() {
+            self.paste_sheet_text(text);
+            return;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() || self.active_layer().locked {
+            return;
+        }
+        if let Ok(payload) = serde_json::from_str::<ElementClipboard>(trimmed) {
+            self.paste_elements(payload);
+            return;
+        }
+        self.add_element(Element::Text(TextNote {
+            id: Uuid::new_v4(),
+            origin: self.screen_to_world(Point::new(48.0, 48.0)),
+            text: trimmed.to_owned(),
+            font_size: 18.0,
+            color: self.style.color,
+            max_width: Some(420.0),
+        }));
+    }
+
+    fn paste_pixbuf(&mut self, pixbuf: Pixbuf, name: &str) {
+        if self.active_layer().is_spreadsheet() || self.active_layer().locked {
+            return;
+        }
+        let Ok(bytes) = pixbuf.save_to_bufferv("png", &[]) else {
+            return;
+        };
+        let asset_id = Uuid::new_v4();
+        self.image_cache.insert(asset_id, pixbuf.clone());
+        self.notebook.assets.push(Asset {
+            id: asset_id,
+            name: name.to_owned(),
+            media_type: "image/png".to_owned(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        let scale = (640.0 / pixbuf.width() as f32)
+            .min(480.0 / pixbuf.height() as f32)
+            .min(1.0);
+        let width = pixbuf.width() as f32 * scale;
+        let height = pixbuf.height() as f32 * scale;
+        let origin = self.screen_to_world(Point::new(80.0, 80.0));
+        self.add_element(Element::Media(MediaElement {
+            id: Uuid::new_v4(),
+            asset_id,
+            kind: MediaKind::Image,
+            bounds: Rect {
+                x: origin.x,
+                y: origin.y,
+                width,
+                height,
+            },
+            alt_text: name.to_owned(),
+            caption: name.to_owned(),
+        }));
+    }
+
+    fn paste_elements(&mut self, payload: ElementClipboard) {
+        if self.active_layer().locked || self.active_layer().is_spreadsheet() {
+            return;
+        }
+        let mut id_map = HashMap::new();
+        let mut asset_map = HashMap::new();
+        for asset in payload.assets {
+            if self.notebook.asset(asset.id).is_none() {
+                if let Ok(bytes) = asset.decoded()
+                    && let Ok(pixbuf) = decode_pixbuf(&bytes)
+                {
+                    self.image_cache.insert(asset.id, pixbuf);
+                }
+                asset_map.insert(asset.id, asset.id);
+                self.notebook.assets.push(asset);
+            } else {
+                asset_map.insert(asset.id, asset.id);
+            }
+        }
+        let page_id = self.page().id;
+        let layer_id = self.active_layer().id;
+        let start_index = self.active_layer().elements.len();
+        let mut slots = Vec::new();
+        self.selection.clear();
+        for mut element in payload.elements {
+            let new_id = Uuid::new_v4();
+            id_map.insert(element.id(), new_id);
+            element.set_id(new_id);
+            element.translate(Point::new(24.0, 24.0));
+            if let Element::Media(media) = &mut element
+                && let Some(mapped) = asset_map.get(&media.asset_id)
+            {
+                media.asset_id = *mapped;
+            }
+            if let Element::Connector(connector) = &mut element {
+                for endpoint in [&mut connector.start, &mut connector.end] {
+                    if let Some(attachment) = &mut endpoint.attachment
+                        && let Some(mapped) = id_map.get(&attachment.element_id)
+                    {
+                        attachment.element_id = *mapped;
+                    }
+                }
+            }
+            self.selection.insert(new_id);
+            self.active_layer_mut().elements.push(element);
+            slots.push(ElementSlot {
+                layer_id,
+                index: start_index + slots.len(),
+                id: new_id,
+                stored: None,
+            });
+        }
+        if !slots.is_empty() {
+            self.push_history(HistoryEntry::ElementsChanged { page_id, slots });
+            self.dirty = true;
+            self.flash_selection();
+        }
+    }
+
     fn paste_sheet_selection(&mut self) {
         self.commit_sheet_edit();
         let Some((origin, cells)) = self.sheet_clipboard.clone() else {
@@ -1644,19 +2146,6 @@ impl CanvasState {
                 }
                 return true;
             }
-            if ctrl && key == gtk::gdk::Key::c {
-                self.copy_sheet_selection();
-                return true;
-            }
-            if ctrl && key == gtk::gdk::Key::x {
-                self.copy_sheet_selection();
-                self.clear_sheet_selection();
-                return true;
-            }
-            if ctrl && key == gtk::gdk::Key::v {
-                self.paste_sheet_selection();
-                return true;
-            }
             if ctrl && key == gtk::gdk::Key::i {
                 self.toggle_sheet_style(|cell| cell.style.italic = !cell.style.italic);
                 return true;
@@ -1725,9 +2214,11 @@ impl CanvasState {
         let Some(book) = self.active_layer().spreadsheet.clone() else {
             return;
         };
-        if book.hit_grow_handle(world) {
+        if let Some(handle) = book.hit_corner_handle(world) {
             let sheet = book.active();
             self.interaction = Some(Interaction::SheetGrow {
+                handle,
+                origin_before: book.origin,
                 cols_before: sheet.display_cols(),
                 rows_before: sheet.display_rows(),
             });
@@ -2069,7 +2560,23 @@ impl CanvasState {
         let effective_tool = if eraser_tip { Tool::Eraser } else { self.tool };
         match effective_tool {
             Tool::Select => {
-                if let Some(id) = self.hit_test(world) {
+                if let Some(handle) = self.hit_selection_handle(world) {
+                    let bounds = self.selection_bounds().unwrap_or_default();
+                    let before = self.capture_elements(&self.selection);
+                    let originals = self
+                        .page()
+                        .elements()
+                        .filter(|element| self.selection.contains(&element.id()))
+                        .map(|element| (element.id(), element.clone()))
+                        .collect();
+                    self.interaction = Some(Interaction::TransformSelection {
+                        handle,
+                        start: world,
+                        bounds,
+                        originals,
+                        before,
+                    });
+                } else if let Some(id) = self.hit_test(world) {
                     if !self.selection.contains(&id) {
                         self.selection.clear();
                         self.selection.insert(id);
@@ -2200,7 +2707,9 @@ impl CanvasState {
                 sheet_delta = Some(Point::new(world.x - last_world.x, world.y - last_world.y));
                 *last_world = world;
             }
-            Some(Interaction::SheetGrow { .. }) => grow_at = Some(world),
+            Some(Interaction::SheetGrow { handle, .. }) => {
+                grow_at = Some((*handle, world));
+            }
             Some(Interaction::SheetColResize {
                 col,
                 start_x,
@@ -2222,7 +2731,18 @@ impl CanvasState {
                 }
             }
             Some(Interaction::Erase) => self.erase_at(world),
+            Some(Interaction::TransformSelection { .. }) => {}
             None => {}
+        }
+        if let Some(Interaction::TransformSelection {
+            handle,
+            start,
+            bounds,
+            originals,
+            ..
+        }) = &self.interaction
+        {
+            self.apply_live_transform(*handle, *start, world, *bounds, originals.clone());
         }
         if let Some(delta) = selection_delta {
             self.translate_selection(delta);
@@ -2233,11 +2753,10 @@ impl CanvasState {
             book.origin.x += delta.x;
             book.origin.y += delta.y;
         }
-        if let Some(point) = grow_at
+        if let Some((handle, point)) = grow_at
             && let Some(book) = self.active_layer_mut().spreadsheet.as_mut()
         {
-            let (cols, rows) = book.visible_size_at(point);
-            book.active_mut().set_visible_size(cols, rows);
+            book.resize_from_handle(handle, point);
         }
         if let Some((col, width)) = col_resize
             && let Some(book) = self.active_layer_mut().spreadsheet.as_mut()
@@ -2353,6 +2872,8 @@ impl CanvasState {
                 }
             }
             Interaction::SheetGrow {
+                handle: _,
+                origin_before,
                 cols_before,
                 rows_before,
             } => {
@@ -2361,10 +2882,12 @@ impl CanvasState {
                     .spreadsheet
                     .as_ref()
                     .is_some_and(|book| {
-                        book.active().display_cols() != cols_before
+                        book.origin != origin_before
+                            || book.active().display_cols() != cols_before
                             || book.active().display_rows() != rows_before
                     });
                 if changed && let Some(mut stored) = self.capture_spreadsheet() {
+                    stored.2.origin = origin_before;
                     if let Some(sheet) = stored.2.sheets.get_mut(stored.2.active_sheet) {
                         sheet.visible_cols = cols_before;
                         sheet.visible_rows = rows_before;
@@ -2416,6 +2939,24 @@ impl CanvasState {
                     self.fill_sheet_range(source, target);
                 }
             }
+            Interaction::TransformSelection {
+                before, originals, ..
+            } => {
+                let changed = originals.iter().any(|(id, original)| {
+                    self.page()
+                        .elements()
+                        .find(|element| element.id() == *id)
+                        .is_some_and(|current| current != original)
+                });
+                if changed {
+                    let page_id = self.page().id;
+                    self.push_history(HistoryEntry::ElementsChanged {
+                        page_id,
+                        slots: before,
+                    });
+                    self.dirty = true;
+                }
+            }
         }
     }
 
@@ -2437,13 +2978,188 @@ impl CanvasState {
     }
 
     fn erase_at(&mut self, point: Point) {
-        let Some(id) = self.hit_test(point) else {
+        let radius = (12.0 / self.zoom).max(4.0);
+        let mut stroke_target = None;
+        let mut object_id = None;
+        for layer in self.page().layers.iter().rev() {
+            if !layer.visible || layer.locked {
+                continue;
+            }
+            for element in layer.elements.iter().rev() {
+                if let Element::Stroke(stroke) = element {
+                    let hit = stroke.points.windows(2).any(|pair| {
+                        segment_distance(point, pair[0].point(), pair[1].point()) <= radius
+                    });
+                    if hit {
+                        stroke_target = Some((layer.id, stroke.id));
+                        break;
+                    }
+                } else if element.bounds().expand(radius).contains(point) {
+                    object_id = Some(element.id());
+                    break;
+                }
+            }
+            if stroke_target.is_some() || object_id.is_some() {
+                break;
+            }
+        }
+        if let Some(id) = object_id {
+            self.selection.clear();
+            self.selection.insert(id);
+            self.delete_selection();
+            self.selection.clear();
+            return;
+        }
+        let Some((layer_id, stroke_id)) = stroke_target else {
             return;
         };
-        self.selection.clear();
-        self.selection.insert(id);
-        self.delete_selection();
-        self.selection.clear();
+        let Some(layer_index) = self
+            .page()
+            .layers
+            .iter()
+            .position(|layer| layer.id == layer_id)
+        else {
+            return;
+        };
+        let Some(index) = self.page().layers[layer_index]
+            .elements
+            .iter()
+            .position(|element| element.id() == stroke_id)
+        else {
+            return;
+        };
+        let Element::Stroke(stroke) = self.page().layers[layer_index].elements[index].clone()
+        else {
+            return;
+        };
+        let fragments = stroke.erase_disk(point, radius);
+        if fragments.len() == 1 && fragments[0].points == stroke.points {
+            return;
+        }
+        let page_id = self.page().id;
+        let mut slots = vec![ElementSlot {
+            layer_id,
+            index,
+            id: stroke.id,
+            stored: Some(Element::Stroke(stroke)),
+        }];
+        let elements = &mut self.page_mut().layers[layer_index].elements;
+        if fragments.is_empty() {
+            elements.remove(index);
+        } else {
+            let mut first = fragments[0].clone();
+            first.id = stroke_id;
+            elements[index] = Element::Stroke(first);
+            for (offset, fragment) in fragments.into_iter().skip(1).enumerate() {
+                let id = fragment.id;
+                let insert_at = index + 1 + offset;
+                elements.insert(insert_at, Element::Stroke(fragment));
+                slots.push(ElementSlot {
+                    layer_id,
+                    index: insert_at,
+                    id,
+                    stored: None,
+                });
+            }
+        }
+        self.push_history(HistoryEntry::ElementsChanged { page_id, slots });
+        self.dirty = true;
+    }
+
+    fn selection_bounds(&self) -> Option<Rect> {
+        self.page()
+            .visible_elements()
+            .filter(|element| self.selection.contains(&element.id()))
+            .map(Element::bounds)
+            .reduce(Rect::union)
+    }
+
+    fn hit_selection_handle(&self, point: Point) -> Option<HandleKind> {
+        let bounds = self.selection_bounds()?.expand(6.0 / self.zoom);
+        let handle = 10.0 / self.zoom;
+        let rotate = Point::new(bounds.center().x, bounds.y - 22.0 / self.zoom);
+        if point.distance_to(rotate) <= handle {
+            return Some(HandleKind::Rotate);
+        }
+        let corners = [
+            (HandleKind::Nw, Point::new(bounds.x, bounds.y)),
+            (
+                HandleKind::Ne,
+                Point::new(bounds.x + bounds.width, bounds.y),
+            ),
+            (
+                HandleKind::Sw,
+                Point::new(bounds.x, bounds.y + bounds.height),
+            ),
+            (
+                HandleKind::Se,
+                Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
+            ),
+        ];
+        corners
+            .into_iter()
+            .find(|(_, corner)| point.distance_to(*corner) <= handle)
+            .map(|(kind, _)| kind)
+    }
+
+    fn apply_live_transform(
+        &mut self,
+        handle: HandleKind,
+        start: Point,
+        current: Point,
+        bounds: Rect,
+        originals: Vec<(Uuid, Element)>,
+    ) {
+        let center = bounds.center();
+        let map: HashMap<Uuid, Element> = originals.into_iter().collect();
+        for layer in &mut self.page_mut().layers {
+            for element in &mut layer.elements {
+                let Some(original) = map.get(&element.id()) else {
+                    continue;
+                };
+                *element = original.clone();
+                match handle {
+                    HandleKind::Rotate => {
+                        let start_angle = (start.y - center.y).atan2(start.x - center.x);
+                        let current_angle = (current.y - center.y).atan2(current.x - center.x);
+                        let degrees = (current_angle - start_angle).to_degrees();
+                        element.rotate_about(center, degrees);
+                    }
+                    corner => {
+                        let (pivot, start_corner) = match corner {
+                            HandleKind::Nw => (
+                                Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
+                                Point::new(bounds.x, bounds.y),
+                            ),
+                            HandleKind::Ne => (
+                                Point::new(bounds.x, bounds.y + bounds.height),
+                                Point::new(bounds.x + bounds.width, bounds.y),
+                            ),
+                            HandleKind::Sw => (
+                                Point::new(bounds.x + bounds.width, bounds.y),
+                                Point::new(bounds.x, bounds.y + bounds.height),
+                            ),
+                            HandleKind::Se => (
+                                Point::new(bounds.x, bounds.y),
+                                Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
+                            ),
+                            HandleKind::Rotate => unreachable!(),
+                        };
+                        let sx = if (start_corner.x - pivot.x).abs() > 1.0 {
+                            (current.x - pivot.x) / (start_corner.x - pivot.x)
+                        } else {
+                            1.0
+                        };
+                        let sy = if (start_corner.y - pivot.y).abs() > 1.0 {
+                            (current.y - pivot.y) / (start_corner.y - pivot.y)
+                        } else {
+                            1.0
+                        };
+                        element.scale_about(pivot, sx.clamp(0.08, 12.0), sy.clamp(0.08, 12.0));
+                    }
+                }
+            }
+        }
     }
 
     fn push_history(&mut self, entry: HistoryEntry) {
@@ -3042,11 +3758,25 @@ fn draw_spreadsheet(
     viewport: Rect,
     interactive: bool,
 ) {
-    let bounds = book.bounds();
+    let sheet = book.active();
+    let cols = if interactive {
+        sheet.display_cols()
+    } else {
+        sheet.export_cols()
+    };
+    let rows = if interactive {
+        sheet.display_rows()
+    } else {
+        sheet.export_rows()
+    };
+    let bounds = if interactive {
+        book.bounds()
+    } else {
+        book.bounds_for(cols, rows)
+    };
     if !bounds.intersects(viewport.expand(24.0)) {
         return;
     }
-    let sheet = book.active();
     let active = state.active_layer().id == layer_id;
     context.set_source_rgb(1.0, 1.0, 1.0);
     context.rectangle(
@@ -3076,8 +3806,6 @@ fn draw_spreadsheet(
         if active { "editing" } else { "spreadsheet" }
     ));
 
-    let cols = sheet.display_cols();
-    let rows = sheet.display_rows();
     let header_top = bounds.y + crate::spreadsheet::TITLE_HEIGHT;
     context.set_font_size(10.0);
     context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
@@ -3119,8 +3847,8 @@ fn draw_spreadsheet(
     } else {
         None
     };
-    let xs = book.col_stops();
-    let ys = book.row_stops();
+    let xs = book.col_stops_n(cols);
+    let ys = book.row_stops_n(rows);
     let mut eval = EvalContext::new(&book.sheets, book.active_sheet, CellAddr { col: 0, row: 0 });
     let clip = viewport.expand(8.0);
     for col in 0..cols {
@@ -3252,6 +3980,10 @@ fn draw_spreadsheet(
         let _ = context.fill();
     }
 
+    if interactive && (sheet.frozen_rows > 0 || sheet.frozen_cols > 0) {
+        draw_frozen_panes(context, state, book, viewport, &xs, &ys);
+    }
+
     let tab_top = bounds.y + bounds.height - crate::spreadsheet::TAB_HEIGHT;
     context.set_source_rgb(0.94, 0.95, 0.94);
     context.rectangle(
@@ -3278,13 +4010,22 @@ fn draw_spreadsheet(
         tab_x += width + 6.0;
     }
 
-    let grow = book.grow_handle_rect();
-    context.set_source_rgb(0.18, 0.42, 0.28);
-    context.move_to(grow.x as f64, (grow.y + grow.height) as f64);
-    context.line_to((grow.x + grow.width) as f64, (grow.y + grow.height) as f64);
-    context.line_to((grow.x + grow.width) as f64, grow.y as f64);
-    context.close_path();
-    let _ = context.fill();
+    for handle in [
+        SheetHandle::Nw,
+        SheetHandle::Ne,
+        SheetHandle::Sw,
+        SheetHandle::Se,
+    ] {
+        let rect = book.corner_handle_rect(handle);
+        context.set_source_rgb(0.18, 0.42, 0.28);
+        context.rectangle(
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+        );
+        let _ = context.fill();
+    }
 }
 
 fn draw_interaction(context: &Context, state: &CanvasState) {
@@ -3334,6 +4075,7 @@ fn draw_interaction(context: &Context, state: &CanvasState) {
         | Some(Interaction::SheetGrow { .. })
         | Some(Interaction::SheetColResize { .. })
         | Some(Interaction::SheetRowResize { .. })
+        | Some(Interaction::TransformSelection { .. })
         | None => {}
         Some(Interaction::SheetSelect { start, current }) => {
             draw_sheet_range_preview(context, state, CellRange::new(*start, *current));
@@ -3396,6 +4138,19 @@ fn draw_selection(context: &Context, state: &CanvasState) {
             );
             let _ = context.fill();
         }
+        let rotate = Point::new(bounds.center().x, bounds.y - 22.0 / state.zoom);
+        context.set_line_width(1.2 / state.zoom as f64);
+        context.move_to(bounds.center().x as f64, bounds.y as f64);
+        context.line_to(rotate.x as f64, rotate.y as f64);
+        let _ = context.stroke();
+        context.arc(
+            rotate.x as f64,
+            rotate.y as f64,
+            (handle * 0.7) as f64,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        let _ = context.fill();
     }
 }
 
@@ -3876,4 +4631,262 @@ fn set_source(context: &Context, color: Color) {
         color.blue as f64,
         color.alpha as f64,
     );
+}
+
+fn segment_distance(point: Point, a: Point, b: Point) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let length = dx * dx + dy * dy;
+    if length < f32::EPSILON {
+        return point.distance_to(a);
+    }
+    let t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / length;
+    let t = t.clamp(0.0, 1.0);
+    point.distance_to(Point::new(a.x + dx * t, a.y + dy * t))
+}
+
+fn draw_frozen_panes(
+    context: &Context,
+    state: &CanvasState,
+    book: &Spreadsheet,
+    viewport: Rect,
+    xs: &[f32],
+    ys: &[f32],
+) {
+    let sheet = book.active();
+    let grid_left = book.origin.x + crate::spreadsheet::HEADER_COL_WIDTH;
+    let grid_top =
+        book.origin.y + crate::spreadsheet::TITLE_HEIGHT + crate::spreadsheet::HEADER_ROW_HEIGHT;
+    let frozen_width = if sheet.frozen_cols == 0 {
+        0.0
+    } else {
+        xs.get(sheet.frozen_cols as usize)
+            .copied()
+            .unwrap_or(grid_left)
+            - grid_left
+    };
+    let frozen_height = if sheet.frozen_rows == 0 {
+        0.0
+    } else {
+        ys.get(sheet.frozen_rows as usize)
+            .copied()
+            .unwrap_or(grid_top)
+            - grid_top
+    };
+    let sticky_x = if sheet.frozen_cols > 0 && viewport.x > grid_left {
+        viewport.x.min(
+            grid_left + book.bounds().width - frozen_width - crate::spreadsheet::HEADER_COL_WIDTH,
+        )
+    } else {
+        grid_left
+    };
+    let sticky_y = if sheet.frozen_rows > 0 && viewport.y > grid_top {
+        viewport.y.min(
+            grid_top + book.bounds().height
+                - frozen_height
+                - crate::spreadsheet::TAB_HEIGHT
+                - crate::spreadsheet::TITLE_HEIGHT,
+        )
+    } else {
+        grid_top
+    };
+    if sheet.frozen_cols > 0 {
+        context.set_source_rgb(1.0, 1.0, 1.0);
+        context.rectangle(
+            sticky_x as f64,
+            grid_top as f64,
+            frozen_width as f64,
+            (book.bounds().height
+                - crate::spreadsheet::TITLE_HEIGHT
+                - crate::spreadsheet::HEADER_ROW_HEIGHT
+                - crate::spreadsheet::TAB_HEIGHT) as f64,
+        );
+        let _ = context.fill();
+        let _ = context.save();
+        context.translate((sticky_x - grid_left) as f64, 0.0);
+        draw_sheet_cell_range(
+            context,
+            state,
+            book,
+            (xs, ys),
+            0..sheet.frozen_cols,
+            0..sheet.display_rows(),
+        );
+        let _ = context.restore();
+        context.set_source_rgb(0.18, 0.42, 0.28);
+        context.set_line_width(1.6 / state.zoom as f64);
+        context.move_to((sticky_x + frozen_width) as f64, grid_top as f64);
+        context.line_to(
+            (sticky_x + frozen_width) as f64,
+            (grid_top + book.bounds().height
+                - crate::spreadsheet::TITLE_HEIGHT
+                - crate::spreadsheet::HEADER_ROW_HEIGHT
+                - crate::spreadsheet::TAB_HEIGHT) as f64,
+        );
+        let _ = context.stroke();
+    }
+    if sheet.frozen_rows > 0 {
+        context.set_source_rgb(1.0, 1.0, 1.0);
+        context.rectangle(
+            grid_left as f64,
+            sticky_y as f64,
+            (book.bounds().width - crate::spreadsheet::HEADER_COL_WIDTH) as f64,
+            frozen_height as f64,
+        );
+        let _ = context.fill();
+        let _ = context.save();
+        context.translate(0.0, (sticky_y - grid_top) as f64);
+        draw_sheet_cell_range(
+            context,
+            state,
+            book,
+            (xs, ys),
+            0..sheet.display_cols(),
+            0..sheet.frozen_rows,
+        );
+        let _ = context.restore();
+        context.set_source_rgb(0.18, 0.42, 0.28);
+        context.set_line_width(1.6 / state.zoom as f64);
+        context.move_to(grid_left as f64, (sticky_y + frozen_height) as f64);
+        context.line_to(
+            (grid_left + book.bounds().width - crate::spreadsheet::HEADER_COL_WIDTH) as f64,
+            (sticky_y + frozen_height) as f64,
+        );
+        let _ = context.stroke();
+    }
+    if sheet.frozen_cols > 0 && sheet.frozen_rows > 0 {
+        context.set_source_rgb(1.0, 1.0, 1.0);
+        context.rectangle(
+            sticky_x as f64,
+            sticky_y as f64,
+            frozen_width as f64,
+            frozen_height as f64,
+        );
+        let _ = context.fill();
+        let _ = context.save();
+        context.translate((sticky_x - grid_left) as f64, (sticky_y - grid_top) as f64);
+        draw_sheet_cell_range(
+            context,
+            state,
+            book,
+            (xs, ys),
+            0..sheet.frozen_cols,
+            0..sheet.frozen_rows,
+        );
+        let _ = context.restore();
+    }
+}
+
+fn draw_sheet_cell_range(
+    context: &Context,
+    state: &CanvasState,
+    book: &Spreadsheet,
+    stops: (&[f32], &[f32]),
+    cols: std::ops::Range<u32>,
+    rows: std::ops::Range<u32>,
+) {
+    let (xs, ys) = stops;
+    let sheet = book.active();
+    let mut eval = EvalContext::new(&book.sheets, book.active_sheet, CellAddr { col: 0, row: 0 });
+    for col in cols {
+        for row in rows.clone() {
+            let addr = CellAddr { col, row };
+            if sheet.merge_anchor(addr) != addr {
+                continue;
+            }
+            let (x, y, width, height) = merged_cell_box(sheet, xs, ys, addr);
+            context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
+            context.set_line_width(0.6 / state.zoom as f64);
+            context.rectangle(x as f64, y as f64, width as f64, height as f64);
+            let _ = context.stroke();
+            let Some(cell) = sheet.cells.get(&addr) else {
+                continue;
+            };
+            if let Some(fill) = cell.style.fill {
+                set_source(context, fill);
+                context.rectangle(x as f64, y as f64, width as f64, height as f64);
+                let _ = context.fill();
+            }
+            let value = eval.evaluate_cell(book.active_sheet, addr);
+            let text = book.format_value(book.active_sheet, addr, &value);
+            if text.is_empty() {
+                continue;
+            }
+            set_source(context, cell.style.text_color());
+            context.select_font_face(
+                "Sans",
+                cairo::FontSlant::Normal,
+                if cell.style.bold {
+                    cairo::FontWeight::Bold
+                } else {
+                    cairo::FontWeight::Normal
+                },
+            );
+            context.set_font_size(cell.style.font_size_or_default() as f64);
+            context.move_to((x + 4.0) as f64, (y + height * 0.72) as f64);
+            let _ = context.show_text(&text);
+        }
+    }
+}
+
+fn render_selection_png(state: &CanvasState) -> Option<Vec<u8>> {
+    let bounds = state.selection_bounds()?.expand(8.0);
+    let width = (bounds.width.ceil() as i32).clamp(1, 4096);
+    let height = (bounds.height.ceil() as i32).clamp(1, 4096);
+    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height).ok()?;
+    let context = Context::new(&surface).ok()?;
+    context.set_source_rgb(1.0, 1.0, 1.0);
+    let _ = context.paint();
+    context.translate(-bounds.x as f64, -bounds.y as f64);
+    for element in state
+        .page()
+        .visible_elements()
+        .filter(|element| state.selection.contains(&element.id()))
+    {
+        draw_element(&context, element, &state.image_cache);
+    }
+    drop(context);
+    let mut png = Vec::new();
+    surface.write_to_png(&mut Cursor::new(&mut png)).ok()?;
+    Some(png)
+}
+
+fn rasterize_pdf_pages(path: &Path) -> Result<Vec<(Vec<u8>, i32, i32)>, DocumentError> {
+    let pdftoppm = Command::new("pdftoppm").arg("-h").output();
+    if pdftoppm.is_err() {
+        return Ok(Vec::new());
+    }
+    let directory = std::env::temp_dir().join(format!("inkstone-pdf-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory)?;
+    let prefix = directory.join("page");
+    let status = Command::new("pdftoppm")
+        .args([
+            "-png",
+            "-r",
+            "144",
+            path.to_string_lossy().as_ref(),
+            prefix.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .map_err(|error| DocumentError::Export(format!("pdftoppm failed: {error}")))?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&directory);
+        return Ok(Vec::new());
+    }
+    let mut pages = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&directory)
+        .map_err(DocumentError::from)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("png"))
+        .collect();
+    entries.sort();
+    for page in entries {
+        let bytes = fs::read(&page)?;
+        if let Ok(pixbuf) = decode_pixbuf(&bytes) {
+            pages.push((bytes, pixbuf.width(), pixbuf.height()));
+        }
+    }
+    let _ = fs::remove_dir_all(&directory);
+    Ok(pages)
 }

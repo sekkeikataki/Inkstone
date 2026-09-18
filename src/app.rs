@@ -834,6 +834,9 @@ fn build_menu() -> gio::Menu {
     let edit = gio::Menu::new();
     edit.append(Some("Undo"), Some("win.undo"));
     edit.append(Some("Redo"), Some("win.redo"));
+    edit.append(Some("Cut"), Some("win.cut"));
+    edit.append(Some("Copy"), Some("win.copy"));
+    edit.append(Some("Paste"), Some("win.paste"));
     edit.append(Some("Duplicate Selection"), Some("win.duplicate"));
     edit.append(Some("Delete Selection"), Some("win.delete"));
     menu.append_section(None, &edit);
@@ -1599,6 +1602,16 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
         let canvas = canvas.clone();
         move |_| canvas.insert_sheet_row()
     });
+    let freeze = gtk::Button::builder()
+        .label("Freeze")
+        .tooltip_text("Freeze rows above and columns left of the active cell (A1 clears)")
+        .build();
+    freeze.add_css_class("flat");
+    freeze.add_css_class("pill");
+    freeze.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.freeze_sheet_panes()
+    });
     let sheet = gtk::Button::builder()
         .label("Sheet")
         .tooltip_text("Add a worksheet tab")
@@ -1624,6 +1637,7 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     tools.append(&add_rows);
     tools.append(&insert_col);
     tools.append(&insert_row);
+    tools.append(&freeze);
     tools.append(&sheet);
     tools.append(&sheet_fill_colors(canvas));
     let column = gtk::Box::builder()
@@ -1889,6 +1903,30 @@ fn install_actions(
             );
         }
     });
+    add_action(window, "copy", {
+        let canvas = canvas.clone();
+        let status = status.clone();
+        move || {
+            canvas.copy_selection();
+            status.whisper("Copied");
+        }
+    });
+    add_action(window, "cut", {
+        let canvas = canvas.clone();
+        let status = status.clone();
+        move || {
+            canvas.cut_selection();
+            status.whisper("Cut");
+        }
+    });
+    add_action(window, "paste", {
+        let canvas = canvas.clone();
+        let status = status.clone();
+        move || {
+            canvas.paste_clipboard();
+            status.whisper("Pasted");
+        }
+    });
     add_action(window, "previous-page", {
         let canvas = canvas.clone();
         let navigator = navigator.clone();
@@ -1974,6 +2012,9 @@ fn install_shortcuts(application: &adw::Application) {
         ("win.undo", &["<primary>z"][..]),
         ("win.redo", &["<primary><shift>z", "<primary>y"][..]),
         ("win.duplicate", &["<primary>d"][..]),
+        ("win.copy", &["<primary>c"][..]),
+        ("win.cut", &["<primary>x"][..]),
+        ("win.paste", &["<primary>v"][..]),
         ("win.delete", &["Delete", "BackSpace"][..]),
         ("win.previous-page", &["<alt>Left"][..]),
         ("win.next-page", &["<alt>Right"][..]),

@@ -157,3 +157,45 @@ fn bounds_and_view_intersection_work_with_negative_canvas_coordinates() {
         height: 50.0,
     }));
 }
+
+#[test]
+fn stroke_eraser_splits_ink_instead_of_deleting_the_whole_stroke() {
+    let stroke = Stroke {
+        id: Uuid::new_v4(),
+        kind: StrokeKind::Pen,
+        style: style(),
+        points: vec![
+            StrokePoint::new(Point::new(0.0, 0.0), 1.0),
+            StrokePoint::new(Point::new(40.0, 0.0), 1.0),
+            StrokePoint::new(Point::new(80.0, 0.0), 1.0),
+        ],
+    };
+    let fragments = stroke.erase_disk(Point::new(40.0, 0.0), 8.0);
+    assert_eq!(fragments.len(), 2);
+    assert!(fragments[0].points.iter().all(|point| point.x < 36.0));
+    assert!(fragments[1].points.iter().all(|point| point.x > 44.0));
+}
+
+#[test]
+fn shapes_and_media_scale_from_a_handle_pivot() {
+    let mut shape = Element::Shape(Shape {
+        id: Uuid::new_v4(),
+        kind: ShapeKind::Rectangle,
+        bounds: Rect {
+            x: 10.0,
+            y: 10.0,
+            width: 40.0,
+            height: 20.0,
+        },
+        rotation_degrees: 0.0,
+        style: style(),
+        fill: None,
+        label: String::new(),
+    });
+    shape.scale_about(Point::new(10.0, 10.0), 2.0, 2.0);
+    let Element::Shape(shape) = shape else {
+        unreachable!();
+    };
+    assert!((shape.bounds.width - 80.0).abs() < 0.01);
+    assert!((shape.bounds.height - 40.0).abs() < 0.01);
+}

@@ -333,6 +333,55 @@ fn new_workbook_spawns_a_ten_by_ten_grid_you_can_extend() {
     assert_eq!(book.active().display_rows(), 17);
     let handle = book.grow_handle_rect();
     assert!(book.hit_grow_handle(Point::new(handle.x + 1.0, handle.y + 1.0)));
+    assert_eq!(
+        book.hit_corner_handle(Point::new(handle.x + 1.0, handle.y + 1.0)),
+        Some(inkstone::spreadsheet::SheetHandle::Se)
+    );
+}
+
+#[test]
+fn freeze_panes_and_used_range_export_ignore_empty_padding() {
+    let mut book = Spreadsheet::new();
+    book.active_mut()
+        .set_input(CellAddr { col: 0, row: 0 }, "Name".into());
+    book.active_mut()
+        .set_input(CellAddr { col: 1, row: 0 }, "Qty".into());
+    book.active_mut()
+        .set_input(CellAddr { col: 1, row: 2 }, "3".into());
+    book.active_mut().freeze_at(CellAddr { col: 1, row: 1 });
+    assert_eq!(book.active().frozen_cols, 1);
+    assert_eq!(book.active().frozen_rows, 1);
+    assert_eq!(book.active().display_cols(), 10);
+    assert_eq!(book.active().export_cols(), 2);
+    assert_eq!(book.active().export_rows(), 3);
+    let printed = book.print_bounds();
+    let displayed = book.bounds();
+    assert!(printed.width < displayed.width);
+    assert!(printed.height < displayed.height);
+    book.active_mut().freeze_at(CellAddr { col: 0, row: 0 });
+    assert_eq!(book.active().frozen_cols, 0);
+    assert_eq!(book.active().frozen_rows, 0);
+}
+
+#[test]
+fn sheet_tsv_round_trips_tab_separated_cells() {
+    let mut book = Spreadsheet::new();
+    book.active_mut()
+        .set_input(CellAddr { col: 0, row: 0 }, "hello\tworld".into());
+    book.active_mut()
+        .set_input(CellAddr { col: 1, row: 0 }, "42".into());
+    let range = CellRange::new(CellAddr { col: 0, row: 0 }, CellAddr { col: 1, row: 0 });
+    let tsv = book.active().to_tsv(range);
+    assert!(tsv.contains("hello"));
+    assert!(tsv.contains("42"));
+    let mut other = Spreadsheet::new();
+    other
+        .active_mut()
+        .paste_tsv(CellAddr { col: 2, row: 3 }, &tsv);
+    assert_eq!(
+        other.active().cells[&CellAddr { col: 3, row: 3 }].input,
+        "42"
+    );
 }
 
 #[test]

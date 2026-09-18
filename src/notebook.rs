@@ -130,6 +130,25 @@ impl NotebookPage {
         }
     }
 
+    pub fn export_bounds(&self) -> Option<Rect> {
+        let element_bounds = self
+            .visible_elements()
+            .map(Element::bounds)
+            .reduce(Rect::union);
+        let sheet_bounds = self
+            .layers
+            .iter()
+            .filter(|layer| layer.visible)
+            .filter_map(|layer| layer.spreadsheet.as_ref().map(Spreadsheet::print_bounds))
+            .reduce(Rect::union);
+        match (element_bounds, sheet_bounds) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     pub fn snap_endpoint(&self, target: Point, max_distance: f32) -> Endpoint {
         let mut best: Option<(f32, Uuid, Anchor, Point)> = None;
         for element in self.visible_elements() {
@@ -422,7 +441,7 @@ impl Notebook {
 
     fn page_svg(&self, page: &NotebookPage) -> String {
         let bounds = page
-            .content_bounds()
+            .export_bounds()
             .unwrap_or(Rect {
                 x: -640.0,
                 y: -360.0,

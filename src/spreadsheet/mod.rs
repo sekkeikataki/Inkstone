@@ -290,6 +290,78 @@ impl Sheet {
         self.visible_rows = self.display_rows().max(addr.row + 1).min(MAX_ROWS);
     }
 
+    pub fn export_cols(&self) -> u32 {
+        self.used_cols().max(self.frozen_cols).clamp(1, MAX_COLS)
+    }
+
+    pub fn export_rows(&self) -> u32 {
+        self.used_rows().max(self.frozen_rows).clamp(1, MAX_ROWS)
+    }
+
+    pub fn freeze_at(&mut self, addr: CellAddr) {
+        if addr.col == 0 && addr.row == 0 {
+            self.frozen_cols = 0;
+            self.frozen_rows = 0;
+        } else {
+            self.frozen_cols = addr.col;
+            self.frozen_rows = addr.row;
+        }
+    }
+
+    pub fn to_tsv(&self, range: CellRange) -> String {
+        let mut rows = Vec::new();
+        for row in range.start.row..=range.end.row {
+            let mut cols = Vec::new();
+            for col in range.start.col..=range.end.col {
+                let addr = CellAddr { col, row };
+                let value = self
+                    .cells
+                    .get(&addr)
+                    .map(|cell| escape_tsv_field(&cell.input))
+                    .unwrap_or_default();
+                cols.push(value);
+            }
+            rows.push(cols.join("\t"));
+        }
+        rows.join("\n")
+    }
+
+    pub fn to_html(&self, range: CellRange) -> String {
+        let mut html = String::from("<table>");
+        for row in range.start.row..=range.end.row {
+            html.push_str("<tr>");
+            for col in range.start.col..=range.end.col {
+                let addr = CellAddr { col, row };
+                let value = self
+                    .cells
+                    .get(&addr)
+                    .map(|cell| crate::document::escape_xml(&cell.input))
+                    .unwrap_or_default();
+                html.push_str("<td>");
+                html.push_str(&value);
+                html.push_str("</td>");
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</table>");
+        html
+    }
+
+    pub fn paste_tsv(&mut self, dest: CellAddr, tsv: &str) {
+        for (row_offset, line) in tsv.split('\n').enumerate() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() && row_offset + 1 == tsv.lines().count() {
+                continue;
+            }
+            for (col_offset, field) in split_tsv_line(line).into_iter().enumerate() {
+                let Some(addr) = dest.offset(col_offset as i32, row_offset as i32) else {
+                    continue;
+                };
+                self.set_input(addr, field);
+            }
+        }
+    }
+
     pub fn set_visible_size(&mut self, cols: u32, rows: u32) {
         self.visible_cols = cols.max(self.used_cols()).clamp(MIN_DISPLAY_COLS, MAX_COLS);
         self.visible_rows = rows.max(self.used_rows()).clamp(MIN_DISPLAY_ROWS, MAX_ROWS);
@@ -581,6 +653,14 @@ impl Sheet {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SheetHandle {
+    Nw,
+    Ne,
+    Sw,
+    Se,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Spreadsheet {
     #[serde(default)]
@@ -672,8 +752,11 @@ impl Spreadsheet {
     }
 
     pub fn col_stops(&self) -> Vec<f32> {
+        self.col_stops_n(self.active().display_cols())
+    }
+
+    pub fn col_stops_n(&self, cols: u32) -> Vec<f32> {
         let sheet = self.active();
-        let cols = sheet.display_cols();
         let mut xs = Vec::with_capacity(cols as usize + 1);
         let mut x = self.origin.x + HEADER_COL_WIDTH;
         xs.push(x);
@@ -685,8 +768,11 @@ impl Spreadsheet {
     }
 
     pub fn row_stops(&self) -> Vec<f32> {
+        self.row_stops_n(self.active().display_rows())
+    }
+
+    pub fn row_stops_n(&self, rows: u32) -> Vec<f32> {
         let sheet = self.active();
-        let rows = sheet.display_rows();
         let mut ys = Vec::with_capacity(rows as usize + 1);
         let mut y = self.origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
         ys.push(y);
@@ -711,9 +797,15 @@ impl Spreadsheet {
     }
 
     pub fn bounds(&self) -> Rect {
+        self.bounds_for(self.active().display_cols(), self.active().display_rows())
+    }
+
+    pub fn print_bounds(&self) -> Rect {
+        self.bounds_for(self.active().export_cols(), self.active().export_rows())
+    }
+
+    pub fn bounds_for(&self, cols: u32, rows: u32) -> Rect {
         let sheet = self.active();
-        let cols = sheet.display_cols();
-        let rows = sheet.display_rows();
         let mut width = HEADER_COL_WIDTH;
         for col in 0..cols {
             width += sheet.col_width(col);
@@ -870,46 +962,113 @@ impl Spreadsheet {
     }
 
     pub fn hit_grow_handle(&self, point: Point) -> bool {
-        let handle = self.grow_handle_rect();
-        point.x >= handle.x
-            && point.x <= handle.x + handle.width
-            && point.y >= handle.y
-            && point.y <= handle.y + handle.height
+        self.hit_corner_handle(point) == Some(SheetHandle::Se)
+    }
+
+    pub fn hit_corner_handle(&self, point: Point) -> Option<SheetHandle> {
+        for handle in [
+            SheetHandle::Nw,
+            SheetHandle::Ne,
+            SheetHandle::Sw,
+            SheetHandle::Se,
+        ] {
+            let rect = self.corner_handle_rect(handle);
+            if point.x >= rect.x
+                && point.x <= rect.x + rect.width
+                && point.y >= rect.y
+                && point.y <= rect.y + rect.height
+            {
+                return Some(handle);
+            }
+        }
+        None
     }
 
     pub fn grow_handle_rect(&self) -> Rect {
+        self.corner_handle_rect(SheetHandle::Se)
+    }
+
+    pub fn corner_handle_rect(&self, handle: SheetHandle) -> Rect {
         let bounds = self.bounds();
+        let (x, y) = match handle {
+            SheetHandle::Nw => (bounds.x, bounds.y),
+            SheetHandle::Ne => (bounds.x + bounds.width - GROW_HANDLE, bounds.y),
+            SheetHandle::Sw => (bounds.x, bounds.y + bounds.height - GROW_HANDLE),
+            SheetHandle::Se => (
+                bounds.x + bounds.width - GROW_HANDLE,
+                bounds.y + bounds.height - GROW_HANDLE,
+            ),
+        };
         Rect {
-            x: bounds.x + bounds.width - GROW_HANDLE,
-            y: bounds.y + bounds.height - GROW_HANDLE,
+            x,
+            y,
             width: GROW_HANDLE,
             height: GROW_HANDLE,
         }
     }
 
-    pub fn visible_size_at(&self, point: Point) -> (u32, u32) {
+    pub fn resize_from_handle(&mut self, handle: SheetHandle, point: Point) {
+        let old = self.bounds();
+        let se = Point::new(old.x + old.width, old.y + old.height);
+        let (origin, extent) = match handle {
+            SheetHandle::Se => (self.origin, point),
+            SheetHandle::Ne => (
+                Point::new(self.origin.x, point.y.min(se.y - 80.0)),
+                Point::new(point.x, se.y),
+            ),
+            SheetHandle::Sw => (
+                Point::new(point.x.min(se.x - 80.0), self.origin.y),
+                Point::new(se.x, point.y),
+            ),
+            SheetHandle::Nw => (
+                Point::new(point.x.min(se.x - 80.0), point.y.min(se.y - 80.0)),
+                se,
+            ),
+        };
+        self.origin = origin;
+        let (cols, rows) = self.visible_size_from(origin, extent);
+        self.active_mut().set_visible_size(cols, rows);
+        let next = self.bounds();
+        match handle {
+            SheetHandle::Se => {}
+            SheetHandle::Ne => {
+                self.origin.y += old.y + old.height - (next.y + next.height);
+            }
+            SheetHandle::Sw => {
+                self.origin.x += old.x + old.width - (next.x + next.width);
+            }
+            SheetHandle::Nw => {
+                self.origin.x += old.x + old.width - (next.x + next.width);
+                self.origin.y += old.y + old.height - (next.y + next.height);
+            }
+        }
+    }
+
+    pub fn visible_size_from(&self, origin: Point, point: Point) -> (u32, u32) {
         let sheet = self.active();
         let mut cols = MIN_DISPLAY_COLS;
-        let mut x = self.origin.x + HEADER_COL_WIDTH;
+        let mut x = origin.x + HEADER_COL_WIDTH;
         for col in 0..MAX_COLS.min(256) {
             x += sheet.col_width(col);
+            cols = (col + 1).max(MIN_DISPLAY_COLS);
             if x >= point.x {
-                cols = (col + 1).max(MIN_DISPLAY_COLS);
                 break;
             }
-            cols = (col + 1).max(MIN_DISPLAY_COLS);
         }
         let mut rows = MIN_DISPLAY_ROWS;
-        let mut y = self.origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
+        let mut y = origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
         for row in 0..MAX_ROWS.min(512) {
             y += sheet.row_height(row);
+            rows = (row + 1).max(MIN_DISPLAY_ROWS);
             if y >= point.y {
-                rows = (row + 1).max(MIN_DISPLAY_ROWS);
                 break;
             }
-            rows = (row + 1).max(MIN_DISPLAY_ROWS);
         }
         (cols, rows)
+    }
+
+    pub fn visible_size_at(&self, point: Point) -> (u32, u32) {
+        self.visible_size_from(self.origin, point)
     }
 
     pub fn hit_tab(&self, point: Point) -> Option<usize> {
@@ -998,8 +1157,10 @@ impl Spreadsheet {
     }
 
     pub fn svg(&self, layer_id: impl fmt::Display) -> String {
-        let bounds = self.bounds();
         let sheet = self.active();
+        let cols = sheet.export_cols().min(256);
+        let rows = sheet.export_rows().min(256);
+        let bounds = self.bounds_for(cols, rows);
         let mut svg = format!(
             "<g data-inkstone-id=\"{layer_id}\" data-kind=\"spreadsheet\" data-sheet=\"{}\">\n\
              <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffff\" stroke=\"#c5cad3\" stroke-width=\"1\"/>\n",
@@ -1015,10 +1176,8 @@ impl Spreadsheet {
             bounds.y + 18.0,
             crate::document::escape_xml(&sheet.name)
         ));
-        let cols = sheet.display_cols().min(256);
-        let rows = sheet.display_rows().min(256);
-        let xs = self.col_stops();
-        let ys = self.row_stops();
+        let xs = self.col_stops_n(cols);
+        let ys = self.row_stops_n(rows);
         let mut ctx =
             EvalContext::new(&self.sheets, self.active_sheet, CellAddr { col: 0, row: 0 });
         for col in 0..cols {
@@ -1196,4 +1355,41 @@ fn deserialize_heights<'de, D: Deserializer<'de>>(
         heights.insert(row - 1, height);
     }
     Ok(heights)
+}
+
+fn escape_tsv_field(value: &str) -> String {
+    if value.contains(['\t', '\n', '\r', '"']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn split_tsv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    current.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' && current.is_empty() {
+            quoted = true;
+        } else if ch == '\t' {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    fields.push(current);
+    fields
 }
