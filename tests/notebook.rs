@@ -132,3 +132,20 @@ fn missing_media_asset_is_rejected() {
             .contains("references missing asset")
     );
 }
+
+#[test]
+fn phone_demo_notebook_opens_on_the_shared_core() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/phone-demo.inkstone");
+    let notebook = Notebook::load(&path).unwrap();
+    assert_eq!(notebook.title, "Phone demo");
+    assert_eq!(notebook.pages.len(), 1);
+    assert!(
+        notebook.pages[0]
+            .layers
+            .iter()
+            .any(|layer| layer.is_spreadsheet())
+    );
+    let text = notebook.search("Cable");
+    assert!(!text.is_empty());
+}

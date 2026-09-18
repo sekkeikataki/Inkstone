@@ -2,7 +2,8 @@
 
 Inkstone is a native Linux infinite-canvas notebook for handwriting, typed notes, and early
 electrical/mechanical sketches. It is written in Rust with GTK4/libadwaita: there is no browser
-runtime, Electron layer, or network service.
+runtime, Electron layer, or network service. An Android companion in `android/` opens the same
+`.inkstone` files for viewing and quick edits on a phone.
 
 ## What works
 
@@ -51,6 +52,20 @@ make install PREFIX="$HOME/.local"
 
 `~/.local/bin` must be on `PATH`. To remove it, run
 `make uninstall PREFIX="$HOME/.local"`.
+
+## Android
+
+The phone app is a Jetpack Compose companion that reads and writes the same notebook JSON. Build it
+with Android Studio or:
+
+```bash
+cd android
+./gradlew assembleDebug
+```
+
+Sideload `android/app/build/outputs/apk/debug/app-debug.apk`, then open a `.inkstone` file (try
+[`examples/phone-demo.inkstone`](examples/phone-demo.inkstone)). Use **Page** to pan/zoom, ink, or
+tap-add text; use **Cells** to edit a worksheet. Details are in [`docs/ANDROID.md`](docs/ANDROID.md).
 
 ## Controls
 

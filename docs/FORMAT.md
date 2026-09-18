@@ -107,6 +107,9 @@ This preserves both rendered geometry and the relationship to another element. A
 `north`, `east`, `south`, `west`, `center`, `start`, or `end`. Inkstone rejects dangling
 attachments, duplicate IDs, non-finite geometry, invalid colors, and unsupported versions.
 
+The Android companion (`android/`) opens this same JSON for viewing and quick cell/ink/text edits.
+It keeps unknown fields in the document tree and writes version 2 on save.
+
 ## Compatibility
 
 Readers should check both `format` and `version`, preserve unknown data when possible, and treat
