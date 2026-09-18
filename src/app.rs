@@ -1629,6 +1629,7 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     row.append(&italic);
     row.append(&align);
     row.append(&percent);
+    row.append(&freeze);
     let tools = option_row();
     tools.append(&fill);
     tools.append(&merge);
@@ -1637,7 +1638,6 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     tools.append(&add_rows);
     tools.append(&insert_col);
     tools.append(&insert_row);
-    tools.append(&freeze);
     tools.append(&sheet);
     tools.append(&sheet_fill_colors(canvas));
     let column = gtk::Box::builder()
