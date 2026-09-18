@@ -30,4 +30,33 @@ fn native_media_notebook_and_pdf_flow() {
     assert_eq!(notebook.pages.len(), 2);
     assert_eq!(notebook.assets.len(), 1);
     assert!(std::fs::metadata(pdf_path).unwrap().len() > 100);
+
+    let canvas = Canvas::new();
+    canvas.add_spreadsheet_layer();
+    assert_eq!(
+        canvas.active_layer_kind(),
+        inkstone::spreadsheet::LayerKind::Excel
+    );
+    canvas.set_sheet_formula("10".into());
+    canvas.commit_sheet_formula();
+    assert!(canvas.goto_sheet_address("B1"));
+    canvas.set_sheet_formula("=A1*2".into());
+    canvas.commit_sheet_formula();
+    assert_eq!(canvas.sheet_value(), "20");
+
+    let sheet_path = directory.path().join("budget.inkstone");
+    let svg_path = directory.path().join("budget.svg");
+    let sheet_pdf = directory.path().join("budget.pdf");
+    canvas.save(&sheet_path).unwrap();
+    canvas.export_svg(&svg_path).unwrap();
+    canvas.export_pdf(&sheet_pdf).unwrap();
+    let loaded = Notebook::load(&sheet_path).unwrap();
+    assert_eq!(
+        loaded.pages[0].layers[1].kind,
+        inkstone::spreadsheet::LayerKind::Excel
+    );
+    let svg = std::fs::read_to_string(svg_path).unwrap();
+    assert!(svg.contains("data-kind=\"spreadsheet\""));
+    assert!(svg.contains("20"));
+    assert!(std::fs::metadata(sheet_pdf).unwrap().len() > 100);
 }
