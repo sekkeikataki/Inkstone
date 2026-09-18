@@ -18,12 +18,16 @@ GTK/GDK exposes.
 
 Current behavior:
 
-- Pen tip uses the selected canvas tool and pressure-modulated width.
-- A reported physical eraser temporarily overrides the selected tool.
-- Single touch operates the selected tool; two-finger pinch changes zoom.
+- Pen tip uses the selected canvas tool and pressure-modulated width. GTK tilt axes, when present,
+  slightly thicken brush-like strokes.
+- A reported physical eraser, or a barrel button mapped as button 2, temporarily overrides the
+  selected tool and splits ink strokes instead of deleting whole objects.
+- Single touch operates the selected tool unless a stylus was recently down and Palm is enabled;
+  two-finger pinch changes zoom.
 - Middle mouse or the Pan tool pans. Touchpad scroll pans; Ctrl+scroll zooms.
+- Lazy ink (Stabilizer) damps pointer motion so freehand lines are smoother.
 
-Palm rejection, pen-button mapping, calibration, and rotation are compositor/libinput concerns in
-this version. X11 support depends on the same GTK/GDK exposure but is less consistent across tablet
-models. Hardware verification is required for any specific Lenovo model because firmware and
-digitizer vendors differ within product families.
+Palm-on-glass filtering while a pen is in range is handled in-app. Remaining calibration and
+rotation are compositor/libinput concerns. X11 support depends on the same GTK/GDK exposure but is
+less consistent across tablet models. Hardware verification is required for any specific Lenovo
+model because firmware and digitizer vendors differ within product families.
