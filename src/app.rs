@@ -875,7 +875,7 @@ fn chrome_revealer(
         .child(child)
         .build();
     revealer.connect_reveal_child_notify(|revealer| {
-        revealer.set_can_target(revealer.is_child_revealed());
+        revealer.set_can_target(revealer.reveals_child());
     });
     revealer
 }

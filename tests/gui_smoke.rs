@@ -43,6 +43,9 @@ fn native_media_notebook_and_pdf_flow() {
     canvas.set_sheet_formula("=A1*2".into());
     canvas.commit_sheet_formula();
     assert_eq!(canvas.sheet_value(), "20");
+    canvas.add_sheet_cols();
+    canvas.add_sheet_rows();
+    canvas.add_workbook_sheet();
 
     let sheet_path = directory.path().join("budget.inkstone");
     let svg_path = directory.path().join("budget.svg");
@@ -55,6 +58,10 @@ fn native_media_notebook_and_pdf_flow() {
         loaded.pages[0].layers[1].kind,
         inkstone::spreadsheet::LayerKind::Excel
     );
+    let book = loaded.pages[0].layers[1].spreadsheet.as_ref().unwrap();
+    assert_eq!(book.sheets[0].display_cols(), 15);
+    assert_eq!(book.sheets[0].display_rows(), 15);
+    assert_eq!(book.sheets.len(), 2);
     let svg = std::fs::read_to_string(svg_path).unwrap();
     assert!(svg.contains("data-kind=\"spreadsheet\""));
     assert!(svg.contains("20"));
