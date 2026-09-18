@@ -21,9 +21,15 @@ not run a web engine, background renderer, animation loop, network service, or i
   after a destination has been chosen. It does not poll, and stale timers exit without writing.
 - Elements outside the expanded viewport are rejected by a cheap bounds test before Cairo work.
   Grid spacing doubles at low zoom, bounding line count and avoiding sub-pixel overdraw.
-- Pressure is rendered directly from the stored sample vector. There is no full-canvas bitmap, so
-  the canvas remains effectively unbounded and memory follows document complexity rather than zoom
+- Pressure is rendered directly from the stored sample vector. Consecutive sample pairs whose
+  widths differ by at most 0.08 canvas units share one Cairo stroke, so ordinary handwriting is
+  a few path batches instead of one stroke per segment. There is no full-canvas bitmap, so the
+  canvas remains effectively unbounded and memory follows document complexity rather than zoom
   or canvas extent.
+- Spreadsheet grids are one vertical and one horizontal line pass; empty cells are skipped. Frozen
+  pane overlays redraw only when the viewport has scrolled past the freeze origin. Column and row
+  headers cull to the visible clip. Stroke erase batches one history entry per drag and ignores
+  samples closer than 0.4 of the eraser radius.
 - Undo history is operation-based and capped at 256 edits. Added objects are moved into redo storage
   only when undone rather than permanently duplicated. Selection transforms retain copies only of
   affected objects and attached connectors, not the page or notebook.
@@ -41,9 +47,9 @@ documents (roughly 10,000+ objects, depending on stroke length and hardware) nee
 spatial index and cached tessellation; those are intentionally deferred until profiling can justify
 their memory and invalidation cost.
 
-Cairo pressure rendering currently emits one stroked segment per sample pair. This is responsive
-for ordinary handwriting and exact enough for a first version, but long imported strokes would
-benefit from batched variable-width geometry.
+Cairo pressure rendering batches consecutive similar-width segments. Rapid pressure changes still
+emit shorter strokes; extreme imported polylines would still benefit from tessellated variable-width
+geometry if profiling shows the remaining path count is a bottleneck.
 
 ## Verification
 

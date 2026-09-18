@@ -113,8 +113,12 @@ fn install_css() {
         }
         .tool-options {
             border-radius: 22px;
-            padding: 6px 12px;
-            min-height: 48px;
+            padding: 4px 10px;
+            min-height: 40px;
+        }
+        .tool-options button.pill {
+            min-height: 26px;
+            padding: 0 9px;
         }
         .tool-button {
             border-radius: 999px;
@@ -174,7 +178,7 @@ fn install_css() {
             font-family: monospace;
         }
         .sheet-formula {
-            min-width: 12em;
+            min-width: 10em;
         }
         .swatch-ink { background-color: #1a1f29; }
         .swatch-blue { background-color: #1f61e0; }
@@ -978,7 +982,7 @@ fn build_canvas_workspace(canvas: &Canvas, feedback: &Feedback) -> (gtk::Overlay
     options.add_named(&text_options(canvas), Some("text"));
     options.add_named(&diagram_options(canvas), Some("diagram"));
     options.add_named(
-        &hint_options("Drag over an object to erase it"),
+        &hint_options("Drag through ink to split a stroke"),
         Some("eraser"),
     );
     options.add_named(
@@ -1441,7 +1445,7 @@ fn diagram_options(canvas: &Canvas) -> gtk::Box {
 }
 
 fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
-    let row = option_row();
+    let row = compact_option_row();
     let addr = gtk::Entry::builder()
         .text("A1")
         .width_chars(7)
@@ -1630,7 +1634,7 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     row.append(&align);
     row.append(&percent);
     row.append(&freeze);
-    let tools = option_row();
+    let tools = compact_option_row();
     tools.append(&fill);
     tools.append(&merge);
     tools.append(&sort);
@@ -1665,6 +1669,18 @@ fn option_row() -> gtk::Box {
         .margin_end(10)
         .margin_top(6)
         .margin_bottom(6)
+        .build()
+}
+
+fn compact_option_row() -> gtk::Box {
+    gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .halign(gtk::Align::Center)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(2)
+        .margin_bottom(2)
         .build()
 }
 

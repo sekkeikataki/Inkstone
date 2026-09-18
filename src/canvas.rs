@@ -117,7 +117,11 @@ enum Interaction {
     Pan {
         last_screen: Point,
     },
-    Erase,
+    Erase {
+        last: Point,
+        before: Vec<ElementSlot>,
+        changed: bool,
+    },
     SheetSelect {
         start: CellAddr,
         current: CellAddr,
@@ -614,15 +618,8 @@ impl Canvas {
 
     pub fn add_page(&self) {
         let mut state = self.state.borrow_mut();
-        let page = NotebookPage::named(format!("Page {}", state.notebook.pages.len() + 1));
-        let id = page.id;
-        state.notebook.pages.push(page);
-        state.active_page = state.notebook.pages.len() - 1;
-        state.active_layer = 0;
-        state.push_history(HistoryEntry::PageAdded { id, stored: None });
-        state.dirty = true;
+        state.insert_blank_page();
         state.begin_page_fade();
-        state.reset_sheet_focus();
         drop(state);
         self.schedule_autosave();
         start_canvas_fx(&self.area, &self.state);
@@ -1462,7 +1459,7 @@ impl Canvas {
         let mut first_page = true;
         for (index, (png, width, height)) in rasters.into_iter().enumerate() {
             if !first_page || !self.page_is_blank() {
-                self.add_page();
+                self.state.borrow_mut().insert_blank_page();
             }
             first_page = false;
             let asset_id = Uuid::new_v4();
@@ -1720,6 +1717,18 @@ impl CanvasState {
         let page = self.active_page;
         let layer = self.active_layer;
         &mut self.notebook.pages[page].layers[layer]
+    }
+
+    fn insert_blank_page(&mut self) {
+        let page = NotebookPage::named(format!("Page {}", self.notebook.pages.len() + 1));
+        let id = page.id;
+        self.notebook.pages.push(page);
+        self.active_page = self.notebook.pages.len() - 1;
+        self.active_layer = 0;
+        self.selection.clear();
+        self.push_history(HistoryEntry::PageAdded { id, stored: None });
+        self.dirty = true;
+        self.reset_sheet_focus();
     }
 
     fn reset_sheet_focus(&mut self) {
@@ -2615,8 +2624,21 @@ impl CanvasState {
                 }));
             }
             Tool::Eraser => {
-                self.erase_at(world);
-                self.interaction = Some(Interaction::Erase);
+                let ids = self
+                    .page()
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.visible && !layer.locked)
+                    .flat_map(|layer| layer.elements.iter())
+                    .map(Element::id)
+                    .collect();
+                let before = self.capture_elements(&ids);
+                let changed = self.erase_at(world);
+                self.interaction = Some(Interaction::Erase {
+                    last: world,
+                    before,
+                    changed,
+                });
             }
             Tool::Text => {
                 if self.active_layer().locked {
@@ -2672,6 +2694,7 @@ impl CanvasState {
         let mut col_resize = None;
         let mut row_resize = None;
         let mut fill_addr = None;
+        let mut erase_point = None;
         match self.interaction.as_mut() {
             Some(Interaction::Stroke(stroke)) => {
                 let should_add = stroke
@@ -2730,19 +2753,46 @@ impl CanvasState {
                     fill_addr = Some(addr);
                 }
             }
-            Some(Interaction::Erase) => self.erase_at(world),
+            Some(Interaction::Erase { last, .. }) => {
+                let radius = (12.0 / zoom).max(4.0);
+                if last.distance_to(world) >= radius * 0.4 {
+                    *last = world;
+                    erase_point = Some(world);
+                }
+            }
             Some(Interaction::TransformSelection { .. }) => {}
             None => {}
         }
-        if let Some(Interaction::TransformSelection {
-            handle,
-            start,
-            bounds,
-            originals,
-            ..
-        }) = &self.interaction
+        if let Some(point) = erase_point
+            && self.erase_at(point)
+            && let Some(Interaction::Erase { changed, .. }) = &mut self.interaction
         {
-            self.apply_live_transform(*handle, *start, world, *bounds, originals.clone());
+            *changed = true;
+        }
+        if matches!(
+            self.interaction,
+            Some(Interaction::TransformSelection { .. })
+        ) {
+            let (handle, start, bounds, originals) =
+                if let Some(Interaction::TransformSelection {
+                    handle,
+                    start,
+                    bounds,
+                    originals,
+                    ..
+                }) = &mut self.interaction
+                {
+                    (*handle, *start, *bounds, std::mem::take(originals))
+                } else {
+                    unreachable!()
+                };
+            self.apply_live_transform(handle, start, world, bounds, &originals);
+            if let Some(Interaction::TransformSelection {
+                originals: slot, ..
+            }) = &mut self.interaction
+            {
+                *slot = originals;
+            }
         }
         if let Some(delta) = selection_delta {
             self.translate_selection(delta);
@@ -2853,7 +2903,30 @@ impl CanvasState {
                     self.flash_selection();
                 }
             }
-            Interaction::Pan { .. } | Interaction::Erase => {}
+            Interaction::Pan { .. } => {}
+            Interaction::Erase {
+                before, changed, ..
+            } => {
+                if changed {
+                    let before_ids: HashSet<Uuid> = before.iter().map(|slot| slot.id).collect();
+                    let mut slots = before;
+                    for layer in &self.page().layers {
+                        for (index, element) in layer.elements.iter().enumerate() {
+                            if !before_ids.contains(&element.id()) {
+                                slots.push(ElementSlot {
+                                    layer_id: layer.id,
+                                    index,
+                                    id: element.id(),
+                                    stored: None,
+                                });
+                            }
+                        }
+                    }
+                    let page_id = self.page().id;
+                    self.push_history(HistoryEntry::ElementsChanged { page_id, slots });
+                    self.dirty = true;
+                }
+            }
             Interaction::SheetSelect { start, current } => {
                 self.sheet_range = Some(CellRange::new(start, current));
             }
@@ -2977,7 +3050,7 @@ impl CanvasState {
         self.dirty = true;
     }
 
-    fn erase_at(&mut self, point: Point) {
+    fn erase_at(&mut self, point: Point) -> bool {
         let radius = (12.0 / self.zoom).max(4.0);
         let mut stroke_target = None;
         let mut object_id = None;
@@ -3004,14 +3077,27 @@ impl CanvasState {
             }
         }
         if let Some(id) = object_id {
-            self.selection.clear();
-            self.selection.insert(id);
-            self.delete_selection();
-            self.selection.clear();
-            return;
+            for layer in &mut self.page_mut().layers {
+                layer.elements.retain(|element| element.id() != id);
+                for element in &mut layer.elements {
+                    if let Element::Connector(connector) = element {
+                        for endpoint in [&mut connector.start, &mut connector.end] {
+                            if endpoint
+                                .attachment
+                                .as_ref()
+                                .is_some_and(|attachment| attachment.element_id == id)
+                            {
+                                endpoint.attachment = None;
+                            }
+                        }
+                    }
+                }
+            }
+            self.dirty = true;
+            return true;
         }
         let Some((layer_id, stroke_id)) = stroke_target else {
-            return;
+            return false;
         };
         let Some(layer_index) = self
             .page()
@@ -3019,30 +3105,23 @@ impl CanvasState {
             .iter()
             .position(|layer| layer.id == layer_id)
         else {
-            return;
+            return false;
         };
         let Some(index) = self.page().layers[layer_index]
             .elements
             .iter()
             .position(|element| element.id() == stroke_id)
         else {
-            return;
+            return false;
         };
         let Element::Stroke(stroke) = self.page().layers[layer_index].elements[index].clone()
         else {
-            return;
+            return false;
         };
         let fragments = stroke.erase_disk(point, radius);
         if fragments.len() == 1 && fragments[0].points == stroke.points {
-            return;
+            return false;
         }
-        let page_id = self.page().id;
-        let mut slots = vec![ElementSlot {
-            layer_id,
-            index,
-            id: stroke.id,
-            stored: Some(Element::Stroke(stroke)),
-        }];
         let elements = &mut self.page_mut().layers[layer_index].elements;
         if fragments.is_empty() {
             elements.remove(index);
@@ -3051,19 +3130,11 @@ impl CanvasState {
             first.id = stroke_id;
             elements[index] = Element::Stroke(first);
             for (offset, fragment) in fragments.into_iter().skip(1).enumerate() {
-                let id = fragment.id;
-                let insert_at = index + 1 + offset;
-                elements.insert(insert_at, Element::Stroke(fragment));
-                slots.push(ElementSlot {
-                    layer_id,
-                    index: insert_at,
-                    id,
-                    stored: None,
-                });
+                elements.insert(index + 1 + offset, Element::Stroke(fragment));
             }
         }
-        self.push_history(HistoryEntry::ElementsChanged { page_id, slots });
         self.dirty = true;
+        true
     }
 
     fn selection_bounds(&self) -> Option<Rect> {
@@ -3076,7 +3147,7 @@ impl CanvasState {
 
     fn hit_selection_handle(&self, point: Point) -> Option<HandleKind> {
         let bounds = self.selection_bounds()?.expand(6.0 / self.zoom);
-        let handle = 10.0 / self.zoom;
+        let handle = 12.0 / self.zoom;
         let rotate = Point::new(bounds.center().x, bounds.y - 22.0 / self.zoom);
         if point.distance_to(rotate) <= handle {
             return Some(HandleKind::Rotate);
@@ -3108,55 +3179,61 @@ impl CanvasState {
         start: Point,
         current: Point,
         bounds: Rect,
-        originals: Vec<(Uuid, Element)>,
+        originals: &[(Uuid, Element)],
     ) {
         let center = bounds.center();
-        let map: HashMap<Uuid, Element> = originals.into_iter().collect();
+        let rotate = if handle == HandleKind::Rotate {
+            let start_angle = (start.y - center.y).atan2(start.x - center.x);
+            let current_angle = (current.y - center.y).atan2(current.x - center.x);
+            Some((current_angle - start_angle).to_degrees())
+        } else {
+            None
+        };
+        let scale = if handle == HandleKind::Rotate {
+            None
+        } else {
+            let (pivot, start_corner) = match handle {
+                HandleKind::Nw => (
+                    Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
+                    Point::new(bounds.x, bounds.y),
+                ),
+                HandleKind::Ne => (
+                    Point::new(bounds.x, bounds.y + bounds.height),
+                    Point::new(bounds.x + bounds.width, bounds.y),
+                ),
+                HandleKind::Sw => (
+                    Point::new(bounds.x + bounds.width, bounds.y),
+                    Point::new(bounds.x, bounds.y + bounds.height),
+                ),
+                HandleKind::Se => (
+                    Point::new(bounds.x, bounds.y),
+                    Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
+                ),
+                HandleKind::Rotate => unreachable!(),
+            };
+            let sx = if (start_corner.x - pivot.x).abs() > 1.0 {
+                (current.x - pivot.x) / (start_corner.x - pivot.x)
+            } else {
+                1.0
+            };
+            let sy = if (start_corner.y - pivot.y).abs() > 1.0 {
+                (current.y - pivot.y) / (start_corner.y - pivot.y)
+            } else {
+                1.0
+            };
+            Some((pivot, sx.clamp(0.08, 12.0), sy.clamp(0.08, 12.0)))
+        };
         for layer in &mut self.page_mut().layers {
             for element in &mut layer.elements {
-                let Some(original) = map.get(&element.id()) else {
+                let Some((_, original)) = originals.iter().find(|(id, _)| *id == element.id())
+                else {
                     continue;
                 };
                 *element = original.clone();
-                match handle {
-                    HandleKind::Rotate => {
-                        let start_angle = (start.y - center.y).atan2(start.x - center.x);
-                        let current_angle = (current.y - center.y).atan2(current.x - center.x);
-                        let degrees = (current_angle - start_angle).to_degrees();
-                        element.rotate_about(center, degrees);
-                    }
-                    corner => {
-                        let (pivot, start_corner) = match corner {
-                            HandleKind::Nw => (
-                                Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
-                                Point::new(bounds.x, bounds.y),
-                            ),
-                            HandleKind::Ne => (
-                                Point::new(bounds.x, bounds.y + bounds.height),
-                                Point::new(bounds.x + bounds.width, bounds.y),
-                            ),
-                            HandleKind::Sw => (
-                                Point::new(bounds.x + bounds.width, bounds.y),
-                                Point::new(bounds.x, bounds.y + bounds.height),
-                            ),
-                            HandleKind::Se => (
-                                Point::new(bounds.x, bounds.y),
-                                Point::new(bounds.x + bounds.width, bounds.y + bounds.height),
-                            ),
-                            HandleKind::Rotate => unreachable!(),
-                        };
-                        let sx = if (start_corner.x - pivot.x).abs() > 1.0 {
-                            (current.x - pivot.x) / (start_corner.x - pivot.x)
-                        } else {
-                            1.0
-                        };
-                        let sy = if (start_corner.y - pivot.y).abs() > 1.0 {
-                            (current.y - pivot.y) / (start_corner.y - pivot.y)
-                        } else {
-                            1.0
-                        };
-                        element.scale_about(pivot, sx.clamp(0.08, 12.0), sy.clamp(0.08, 12.0));
-                    }
+                if let Some(degrees) = rotate {
+                    element.rotate_about(center, degrees);
+                } else if let Some((pivot, sx, sy)) = scale {
+                    element.scale_about(pivot, sx, sy);
                 }
             }
         }
@@ -3803,43 +3880,61 @@ fn draw_spreadsheet(
         sheet.name,
         sheet.display_cols(),
         sheet.display_rows(),
-        if active { "editing" } else { "spreadsheet" }
+        if !active {
+            "spreadsheet"
+        } else if sheet.frozen_cols + sheet.frozen_rows > 0 {
+            "frozen"
+        } else {
+            "editing"
+        }
     ));
 
+    let clip = viewport.expand(8.0);
     let header_top = bounds.y + crate::spreadsheet::TITLE_HEIGHT;
     context.set_font_size(10.0);
     context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-    let mut x = bounds.x + crate::spreadsheet::HEADER_COL_WIDTH;
-    for col in 0..cols {
-        let width = sheet.col_width(col);
-        context.set_source_rgb(0.91, 0.93, 0.91);
-        context.rectangle(
-            x as f64,
-            header_top as f64,
-            width as f64,
-            crate::spreadsheet::HEADER_ROW_HEIGHT as f64,
-        );
-        let _ = context.fill();
-        context.set_source_rgb(0.28, 0.32, 0.28);
-        context.move_to((x + 6.0) as f64, (header_top + 15.0) as f64);
-        let _ = context.show_text(&col_name(col));
-        x += width;
+    if header_top + crate::spreadsheet::HEADER_ROW_HEIGHT >= clip.y
+        && header_top <= clip.y + clip.height
+    {
+        let mut x = bounds.x + crate::spreadsheet::HEADER_COL_WIDTH;
+        for col in 0..cols {
+            let width = sheet.col_width(col);
+            if x + width >= clip.x && x <= clip.x + clip.width {
+                context.set_source_rgb(0.91, 0.93, 0.91);
+                context.rectangle(
+                    x as f64,
+                    header_top as f64,
+                    width as f64,
+                    crate::spreadsheet::HEADER_ROW_HEIGHT as f64,
+                );
+                let _ = context.fill();
+                context.set_source_rgb(0.28, 0.32, 0.28);
+                context.move_to((x + 6.0) as f64, (header_top + 15.0) as f64);
+                let _ = context.show_text(&col_name(col));
+            }
+            x += width;
+        }
     }
-    let mut y = header_top + crate::spreadsheet::HEADER_ROW_HEIGHT;
-    for row in 0..rows {
-        let height = sheet.row_height(row);
-        context.set_source_rgb(0.91, 0.93, 0.91);
-        context.rectangle(
-            bounds.x as f64,
-            y as f64,
-            crate::spreadsheet::HEADER_COL_WIDTH as f64,
-            height as f64,
-        );
-        let _ = context.fill();
-        context.set_source_rgb(0.28, 0.32, 0.28);
-        context.move_to((bounds.x + 8.0) as f64, (y + height * 0.7) as f64);
-        let _ = context.show_text(&(row + 1).to_string());
-        y += height;
+    if bounds.x + crate::spreadsheet::HEADER_COL_WIDTH >= clip.x && bounds.x <= clip.x + clip.width
+    {
+        let mut y = header_top + crate::spreadsheet::HEADER_ROW_HEIGHT;
+        for row in 0..rows {
+            let height = sheet.row_height(row);
+            if y + height >= clip.y && y <= clip.y + clip.height {
+                context.set_source_rgb(0.91, 0.93, 0.91);
+                context.rectangle(
+                    bounds.x as f64,
+                    y as f64,
+                    crate::spreadsheet::HEADER_COL_WIDTH as f64,
+                    height as f64,
+                );
+                let _ = context.fill();
+                context.set_source_rgb(0.28, 0.32, 0.28);
+                context.move_to((bounds.x + 8.0) as f64, (y + height * 0.7) as f64);
+                let _ = context.show_text(&(row + 1).to_string());
+            }
+            y += height;
+        }
     }
 
     let selected = if interactive && active {
@@ -3849,8 +3944,40 @@ fn draw_spreadsheet(
     };
     let xs = book.col_stops_n(cols);
     let ys = book.row_stops_n(rows);
+    if let (Some(&left), Some(&right), Some(&top), Some(&bottom)) =
+        (xs.first(), xs.last(), ys.first(), ys.last())
+    {
+        context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
+        context.set_line_width(0.6 / state.zoom as f64);
+        for x in &xs {
+            context.move_to(*x as f64, top as f64);
+            context.line_to(*x as f64, bottom as f64);
+        }
+        for y in &ys {
+            context.move_to(left as f64, *y as f64);
+            context.line_to(right as f64, *y as f64);
+        }
+        let _ = context.stroke();
+    }
+    if sheet.frozen_cols > 0
+        && let Some(x) = xs.get(sheet.frozen_cols as usize)
+    {
+        context.set_source_rgb(0.18, 0.42, 0.28);
+        context.set_line_width(1.4 / state.zoom as f64);
+        context.move_to(*x as f64, ys.first().copied().unwrap_or(0.0) as f64);
+        context.line_to(*x as f64, ys.last().copied().unwrap_or(0.0) as f64);
+        let _ = context.stroke();
+    }
+    if sheet.frozen_rows > 0
+        && let Some(y) = ys.get(sheet.frozen_rows as usize)
+    {
+        context.set_source_rgb(0.18, 0.42, 0.28);
+        context.set_line_width(1.4 / state.zoom as f64);
+        context.move_to(xs.first().copied().unwrap_or(0.0) as f64, *y as f64);
+        context.line_to(xs.last().copied().unwrap_or(0.0) as f64, *y as f64);
+        let _ = context.stroke();
+    }
     let mut eval = EvalContext::new(&book.sheets, book.active_sheet, CellAddr { col: 0, row: 0 });
-    let clip = viewport.expand(8.0);
     for col in 0..cols {
         for row in 0..rows {
             let addr = CellAddr { col, row };
@@ -3866,19 +3993,18 @@ fn draw_spreadsheet(
                 continue;
             }
             let cell = sheet.cells.get(&addr);
+            let editing = state
+                .sheet_editing
+                .as_ref()
+                .filter(|(edit_addr, _)| active && *edit_addr == addr);
+            if cell.is_none() && editing.is_none() {
+                continue;
+            }
             if let Some(fill) = cell.and_then(|cell| cell.style.fill) {
                 set_source(context, fill);
                 context.rectangle(x as f64, y as f64, width as f64, height as f64);
                 let _ = context.fill();
             }
-            context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
-            context.set_line_width(0.6 / state.zoom as f64);
-            context.rectangle(x as f64, y as f64, width as f64, height as f64);
-            let _ = context.stroke();
-            let editing = state
-                .sheet_editing
-                .as_ref()
-                .filter(|(edit_addr, _)| active && *edit_addr == addr);
             let (text, value) = if let Some((_, buffer)) = editing {
                 (buffer.clone(), Value::Text(buffer.clone()))
             } else if cell.is_none() {
@@ -3980,7 +4106,12 @@ fn draw_spreadsheet(
         let _ = context.fill();
     }
 
-    if interactive && (sheet.frozen_rows > 0 || sheet.frozen_cols > 0) {
+    let grid_left = book.origin.x + crate::spreadsheet::HEADER_COL_WIDTH;
+    let grid_top =
+        book.origin.y + crate::spreadsheet::TITLE_HEIGHT + crate::spreadsheet::HEADER_ROW_HEIGHT;
+    let sticky = (sheet.frozen_cols > 0 && viewport.x > grid_left + 0.5)
+        || (sheet.frozen_rows > 0 && viewport.y > grid_top + 0.5);
+    if interactive && sticky {
         draw_frozen_panes(context, state, book, viewport, &xs, &ys);
     }
 
@@ -4070,7 +4201,7 @@ fn draw_interaction(context: &Context, state: &CanvasState) {
         }
         Some(Interaction::MoveSelection { .. })
         | Some(Interaction::Pan { .. })
-        | Some(Interaction::Erase)
+        | Some(Interaction::Erase { .. })
         | Some(Interaction::SheetMove { .. })
         | Some(Interaction::SheetGrow { .. })
         | Some(Interaction::SheetColResize { .. })
@@ -4291,6 +4422,12 @@ fn draw_element(context: &Context, element: &Element, image_cache: &HashMap<Uuid
     }
 }
 
+fn stroke_pair_width(stroke: &Stroke, index: usize) -> f32 {
+    let pressure = ((stroke.points[index].pressure + stroke.points[index + 1].pressure) / 2.0)
+        .clamp(0.12, 1.0);
+    stroke.style.width * pressure
+}
+
 fn draw_stroke(context: &Context, stroke: &Stroke) {
     if stroke.points.len() < 2 {
         return;
@@ -4298,12 +4435,22 @@ fn draw_stroke(context: &Context, stroke: &Stroke) {
     set_source(context, stroke.style.color);
     context.set_line_cap(LineCap::Round);
     context.set_line_join(LineJoin::Round);
-    for pair in stroke.points.windows(2) {
-        let pressure = ((pair[0].pressure + pair[1].pressure) / 2.0).clamp(0.12, 1.0);
-        context.set_line_width((stroke.style.width * pressure) as f64);
-        context.move_to(pair[0].x as f64, pair[0].y as f64);
-        context.line_to(pair[1].x as f64, pair[1].y as f64);
+    let mut start = 0;
+    while start + 1 < stroke.points.len() {
+        let width = stroke_pair_width(stroke, start);
+        let mut end = start + 1;
+        while end + 1 < stroke.points.len()
+            && (stroke_pair_width(stroke, end) - width).abs() <= 0.08
+        {
+            end += 1;
+        }
+        context.set_line_width(width as f64);
+        context.move_to(stroke.points[start].x as f64, stroke.points[start].y as f64);
+        for point in &stroke.points[start + 1..=end] {
+            context.line_to(point.x as f64, point.y as f64);
+        }
         let _ = context.stroke();
+        start = end;
     }
 }
 
@@ -4787,6 +4934,28 @@ fn draw_sheet_cell_range(
 ) {
     let (xs, ys) = stops;
     let sheet = book.active();
+    if let (Some(&left), Some(&right), Some(&top), Some(&bottom)) = (
+        xs.get(cols.start as usize),
+        xs.get(cols.end as usize),
+        ys.get(rows.start as usize),
+        ys.get(rows.end as usize),
+    ) {
+        context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
+        context.set_line_width(0.6 / state.zoom as f64);
+        for col in cols.start..=cols.end {
+            if let Some(&x) = xs.get(col as usize) {
+                context.move_to(x as f64, top as f64);
+                context.line_to(x as f64, bottom as f64);
+            }
+        }
+        for row in rows.start..=rows.end {
+            if let Some(&y) = ys.get(row as usize) {
+                context.move_to(left as f64, y as f64);
+                context.line_to(right as f64, y as f64);
+            }
+        }
+        let _ = context.stroke();
+    }
     let mut eval = EvalContext::new(&book.sheets, book.active_sheet, CellAddr { col: 0, row: 0 });
     for col in cols {
         for row in rows.clone() {
@@ -4794,14 +4963,10 @@ fn draw_sheet_cell_range(
             if sheet.merge_anchor(addr) != addr {
                 continue;
             }
-            let (x, y, width, height) = merged_cell_box(sheet, xs, ys, addr);
-            context.set_source_rgba(0.78, 0.82, 0.78, 1.0);
-            context.set_line_width(0.6 / state.zoom as f64);
-            context.rectangle(x as f64, y as f64, width as f64, height as f64);
-            let _ = context.stroke();
             let Some(cell) = sheet.cells.get(&addr) else {
                 continue;
             };
+            let (x, y, width, height) = merged_cell_box(sheet, xs, ys, addr);
             if let Some(fill) = cell.style.fill {
                 set_source(context, fill);
                 context.rectangle(x as f64, y as f64, width as f64, height as f64);
