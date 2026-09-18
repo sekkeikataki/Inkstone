@@ -691,12 +691,15 @@ impl Canvas {
         if !state.active_layer().is_spreadsheet() || state.active_layer().locked {
             return;
         }
+        state.commit_sheet_edit();
         let Some(before) = state.capture_spreadsheet() else {
             return;
         };
         if let Some(spreadsheet) = state.active_layer_mut().spreadsheet.as_mut() {
             spreadsheet.add_sheet();
         }
+        state.sheet_editing = None;
+        state.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
         state.push_spreadsheet_history(before);
         state.dirty = true;
         drop(state);
@@ -1756,14 +1759,17 @@ impl CanvasState {
             return;
         }
         if let Some(index) = book.hit_tab(world) {
-            if book.active_sheet != index
-                && let Some(before) = self.capture_spreadsheet()
-            {
-                if let Some(spreadsheet) = self.active_layer_mut().spreadsheet.as_mut() {
-                    spreadsheet.active_sheet = index;
+            if book.active_sheet != index {
+                self.commit_sheet_edit();
+                if let Some(before) = self.capture_spreadsheet() {
+                    if let Some(spreadsheet) = self.active_layer_mut().spreadsheet.as_mut() {
+                        spreadsheet.active_sheet = index;
+                    }
+                    self.sheet_editing = None;
+                    self.sheet_range = Some(CellRange::single(CellAddr { col: 0, row: 0 }));
+                    self.push_spreadsheet_history(before);
+                    self.dirty = true;
                 }
-                self.push_spreadsheet_history(before);
-                self.dirty = true;
             }
             return;
         }
