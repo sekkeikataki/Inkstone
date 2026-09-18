@@ -637,7 +637,8 @@ impl Navigator {
         for (index, (title, visible, locked, kind)) in
             canvas.layer_summaries().into_iter().enumerate()
         {
-            let (row, name) = editable_nav_row(&title, Some(kind.label()));
+            let (row, name) = editable_nav_row(&title, None);
+            row.set_tooltip_text(Some(kind.label()));
             let vis = layer_icon_toggle("view-reveal-symbolic", "Show or hide layer", visible);
             let lock = layer_icon_toggle("changes-prevent-symbolic", "Lock layer", locked);
             row.add_suffix(&lock);
