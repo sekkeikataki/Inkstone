@@ -55,9 +55,11 @@ make install PREFIX="$HOME/.local"
 Choose a tool from the floating palette. Pen, Shape, and Connector use click-drag. Text places the
 contents of the note field at the clicked position. Shape/connector labels and ink options appear in
 the chip above the canvas. Click a page or layer name in the sidebar to rename it. The layer add
-menu can insert a notes layer or a spreadsheet layer. Spreadsheet layers are workbooks on the
-canvas: click cells, type values or `=` formulas, use the name box and formula bar, Enter/Tab to
-move, Fill to extend a selection, and drag the green title bar to reposition.
+menu can insert a notes layer or a spreadsheet layer. Spreadsheet layers spawn as a 10×10
+workbook on the canvas: click cells, type values or `=` formulas, use the name box and formula bar,
+Enter/Tab to grow past the edge, drag the bottom-right handle to resize the grid, +Col/+Row to add
+blocks of cells, and drag the green title bar to reposition. Column and row headers select,
+resize, and fill like a worksheet.
 
 | Action | Input |
 | --- | --- |
@@ -66,7 +68,7 @@ move, Fill to extend a selection, and drag the green title bar to reposition.
 | Zoom | Pinch, Ctrl+scroll, Ctrl+Plus/Minus, or the zoom chip |
 | Tablet erase | Flip to an eraser tip when GTK reports one |
 | Select/lasso and move | Select tool, then click/drag or drag an empty region |
-| Duplicate/delete selection | Ctrl+D / Delete (clears selected spreadsheet cells on a sheet layer) |
+| Duplicate/delete selection | Ctrl+D / Delete (on a sheet: fill down / clear cells) |
 | Search | Ctrl+F, then Enter for the next match |
 | Import image/PDF | Ctrl+I, or File → Import Image or PDF |
 | Save/open | Ctrl+S / Ctrl+O |

@@ -5,7 +5,7 @@ use crate::document::{
 use crate::notebook::{Asset, Layer, Notebook, NotebookPage, SearchHit};
 use crate::spreadsheet::address::{CellAddr, CellRange, col_name};
 use crate::spreadsheet::formula::Value;
-use crate::spreadsheet::{HAlign, LayerKind, Spreadsheet};
+use crate::spreadsheet::{Cell, HAlign, LayerKind, Spreadsheet};
 use base64::Engine;
 use cairo::PdfSurface;
 use gdk_pixbuf::{Pixbuf, PixbufLoader};
@@ -86,6 +86,7 @@ struct CanvasState {
     sheet_range: Option<CellRange>,
     sheet_editing: Option<(CellAddr, String)>,
     sheet_listeners: Vec<Rc<dyn Fn()>>,
+    sheet_clipboard: Option<(CellAddr, Vec<(CellAddr, Cell)>)>,
 }
 
 enum Interaction {
@@ -117,6 +118,24 @@ enum Interaction {
     SheetMove {
         last_world: Point,
         origin_before: Point,
+    },
+    SheetGrow {
+        cols_before: u32,
+        rows_before: u32,
+    },
+    SheetColResize {
+        col: u32,
+        start_x: f32,
+        width_before: f32,
+    },
+    SheetRowResize {
+        row: u32,
+        start_y: f32,
+        height_before: f32,
+    },
+    SheetFill {
+        source: CellRange,
+        current: CellAddr,
     },
 }
 
@@ -198,6 +217,7 @@ impl Default for CanvasState {
             sheet_range: Some(CellRange::single(CellAddr { col: 0, row: 0 })),
             sheet_editing: None,
             sheet_listeners: Vec::new(),
+            sheet_clipboard: None,
         }
     }
 }
@@ -772,6 +792,9 @@ impl Canvas {
             return false;
         }
         state.commit_sheet_edit();
+        if let Some(book) = state.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().grow_to_include(range.end);
+        }
         state.sheet_range = Some(range);
         drop(state);
         self.emit_sheet_changed();
@@ -817,6 +840,83 @@ impl Canvas {
 
     pub fn fill_sheet_color(&self, color: Color) {
         self.mutate_selected_cells(|cell| cell.style.fill = Some(color));
+    }
+
+    pub fn toggle_sheet_italic(&self) {
+        self.mutate_selected_cells(|cell| cell.style.italic = !cell.style.italic);
+    }
+
+    pub fn add_sheet_rows(&self) {
+        self.mutate_sheet(|book| book.active_mut().add_visible_rows(5));
+    }
+
+    pub fn add_sheet_cols(&self) {
+        self.mutate_sheet(|book| book.active_mut().add_visible_cols(5));
+    }
+
+    pub fn insert_sheet_row(&self) {
+        let row = self
+            .state
+            .borrow()
+            .sheet_range
+            .map(|range| range.start.row)
+            .unwrap_or(0);
+        self.mutate_sheet(|book| book.active_mut().insert_rows(row, 1));
+    }
+
+    pub fn insert_sheet_col(&self) {
+        let col = self
+            .state
+            .borrow()
+            .sheet_range
+            .map(|range| range.start.col)
+            .unwrap_or(0);
+        self.mutate_sheet(|book| book.active_mut().insert_cols(col, 1));
+    }
+
+    pub fn merge_sheet_selection(&self) {
+        let Some(range) = self.state.borrow().sheet_range else {
+            return;
+        };
+        self.mutate_sheet(|book| book.active_mut().merge_range(range));
+    }
+
+    pub fn sort_sheet_selection(&self) {
+        let Some(range) = self.state.borrow().sheet_range else {
+            return;
+        };
+        self.mutate_sheet(|book| book.active_mut().sort_range(range, range.start.col, true));
+    }
+
+    pub fn cycle_number_format(&self) {
+        self.mutate_selected_cells(|cell| {
+            cell.style.number_format = match cell.style.number_format.as_str() {
+                "" | "General" => "#,##0.00".into(),
+                "#,##0.00" => "0%".into(),
+                "0%" => "$#,##0.00".into(),
+                "$#,##0.00" => "yyyy-mm-dd".into(),
+                _ => String::new(),
+            };
+        });
+    }
+
+    fn mutate_sheet(&self, mutator: impl Fn(&mut Spreadsheet)) {
+        let mut state = self.state.borrow_mut();
+        if !state.active_layer().is_spreadsheet() || state.active_layer().locked {
+            return;
+        }
+        let Some(before) = state.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = state.active_layer_mut().spreadsheet.as_mut() {
+            mutator(book);
+        }
+        state.push_spreadsheet_history(before);
+        state.dirty = true;
+        drop(state);
+        self.schedule_autosave();
+        self.emit_sheet_changed();
+        self.area.queue_draw();
     }
 
     fn mutate_selected_cells(&self, mutator: impl Fn(&mut crate::spreadsheet::Cell)) {
@@ -1294,6 +1394,7 @@ impl CanvasState {
         };
         if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
             book.active_mut().set_input(addr, input);
+            book.active_mut().grow_to_include(addr);
         }
         self.push_spreadsheet_history(before);
         self.dirty = true;
@@ -1318,6 +1419,105 @@ impl CanvasState {
         self.push_spreadsheet_history(before);
         self.dirty = true;
         count
+    }
+
+    fn toggle_sheet_style(&mut self, mutator: impl Fn(&mut Cell)) {
+        self.commit_sheet_edit();
+        let Some(range) = self.sheet_range else {
+            return;
+        };
+        let Some(before) = self.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
+            for addr in range.cells() {
+                mutator(book.active_mut().cells.entry(addr).or_default());
+            }
+        }
+        self.push_spreadsheet_history(before);
+        self.dirty = true;
+    }
+
+    fn copy_sheet_selection(&mut self) {
+        let Some(range) = self.sheet_range else {
+            return;
+        };
+        let Some(book) = self.active_layer().spreadsheet.as_ref() else {
+            return;
+        };
+        let mut cells = Vec::new();
+        for addr in range.cells() {
+            if let Some(cell) = book.active().cells.get(&addr) {
+                cells.push((addr, cell.clone()));
+            }
+        }
+        self.sheet_clipboard = Some((range.start, cells));
+    }
+
+    fn paste_sheet_selection(&mut self) {
+        self.commit_sheet_edit();
+        let Some((origin, cells)) = self.sheet_clipboard.clone() else {
+            return;
+        };
+        let dest = self
+            .sheet_range
+            .map(|range| range.start)
+            .unwrap_or(CellAddr { col: 0, row: 0 });
+        let Some(before) = self.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().paste_from(origin, &cells, dest);
+        }
+        self.push_spreadsheet_history(before);
+        self.dirty = true;
+    }
+
+    fn fill_sheet_down(&mut self) {
+        let Some(range) = self.sheet_range else {
+            return;
+        };
+        if range.rows() < 2 {
+            return;
+        }
+        let source = CellRange::new(
+            range.start,
+            CellAddr {
+                col: range.end.col,
+                row: range.start.row,
+            },
+        );
+        self.fill_sheet_range(source, range);
+    }
+
+    fn fill_sheet_right(&mut self) {
+        let Some(range) = self.sheet_range else {
+            return;
+        };
+        if range.cols() < 2 {
+            return;
+        }
+        let source = CellRange::new(
+            range.start,
+            CellAddr {
+                col: range.start.col,
+                row: range.end.row,
+            },
+        );
+        self.fill_sheet_range(source, range);
+    }
+
+    fn fill_sheet_range(&mut self, source: CellRange, target: CellRange) {
+        self.commit_sheet_edit();
+        let Some(before) = self.capture_spreadsheet() else {
+            return;
+        };
+        if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().fill(source, target);
+            book.active_mut().grow_to_include(target.end);
+        }
+        self.push_spreadsheet_history(before);
+        self.dirty = true;
     }
 
     fn handle_sheet_key(&mut self, key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
@@ -1394,6 +1594,35 @@ impl CanvasState {
                 }
                 return true;
             }
+            if ctrl && key == gtk::gdk::Key::c {
+                self.copy_sheet_selection();
+                return true;
+            }
+            if ctrl && key == gtk::gdk::Key::x {
+                self.copy_sheet_selection();
+                self.clear_sheet_selection();
+                return true;
+            }
+            if ctrl && key == gtk::gdk::Key::v {
+                self.paste_sheet_selection();
+                return true;
+            }
+            if ctrl && key == gtk::gdk::Key::i {
+                self.toggle_sheet_style(|cell| cell.style.italic = !cell.style.italic);
+                return true;
+            }
+            if ctrl && key == gtk::gdk::Key::u {
+                self.toggle_sheet_style(|cell| cell.style.underline = !cell.style.underline);
+                return true;
+            }
+            if ctrl && key == gtk::gdk::Key::d {
+                self.fill_sheet_down();
+                return true;
+            }
+            if ctrl && (key == gtk::gdk::Key::r || key == gtk::gdk::Key::R) {
+                self.fill_sheet_right();
+                return true;
+            }
             if let Some(ch) = key.to_unicode()
                 && !ctrl
                 && !ch.is_control()
@@ -1431,6 +1660,9 @@ impl CanvasState {
         let Some(next) = range.end.offset(dcol, drow) else {
             return;
         };
+        if let Some(book) = self.active_layer_mut().spreadsheet.as_mut() {
+            book.active_mut().grow_to_include(next);
+        }
         self.sheet_range = Some(if extend {
             CellRange::new(range.start, next)
         } else {
@@ -1443,6 +1675,39 @@ impl CanvasState {
         let Some(book) = self.active_layer().spreadsheet.clone() else {
             return;
         };
+        if book.hit_grow_handle(world) {
+            let sheet = book.active();
+            self.interaction = Some(Interaction::SheetGrow {
+                cols_before: sheet.display_cols(),
+                rows_before: sheet.display_rows(),
+            });
+            return;
+        }
+        if let Some(range) = self.sheet_range
+            && hit_fill_handle(&book, range, world)
+        {
+            self.interaction = Some(Interaction::SheetFill {
+                source: range,
+                current: range.end,
+            });
+            return;
+        }
+        if let Some(col) = book.hit_col_resize(world) {
+            self.interaction = Some(Interaction::SheetColResize {
+                col,
+                start_x: world.x,
+                width_before: book.active().col_width(col),
+            });
+            return;
+        }
+        if let Some(row) = book.hit_row_resize(world) {
+            self.interaction = Some(Interaction::SheetRowResize {
+                row,
+                start_y: world.y,
+                height_before: book.active().row_height(row),
+            });
+            return;
+        }
         if let Some(index) = book.hit_tab(world) {
             if let Some(before) = self.capture_spreadsheet() {
                 if let Some(spreadsheet) = self.active_layer_mut().spreadsheet.as_mut() {
@@ -1458,6 +1723,30 @@ impl CanvasState {
                 last_world: world,
                 origin_before: book.origin,
             });
+            return;
+        }
+        if book.hit_select_all(world) {
+            let sheet = book.active();
+            if let (Some(start), Some(end)) = (
+                CellAddr::new(0, 0),
+                CellAddr::new(sheet.display_cols() - 1, sheet.display_rows() - 1),
+            ) {
+                self.sheet_range = Some(CellRange::new(start, end));
+            }
+            return;
+        }
+        if let Some(col) = book.hit_col_header(world) {
+            let rows = book.active().display_rows().saturating_sub(1);
+            if let Some(end) = CellAddr::new(col, rows) {
+                self.sheet_range = Some(CellRange::new(CellAddr { col, row: 0 }, end));
+            }
+            return;
+        }
+        if let Some(row) = book.hit_row_header(world) {
+            let cols = book.active().display_cols().saturating_sub(1);
+            if let Some(end) = CellAddr::new(cols, row) {
+                self.sheet_range = Some(CellRange::new(CellAddr { col: 0, row }, end));
+            }
             return;
         }
         if let Some(addr) = book.hit_cell(world) {
@@ -1813,6 +2102,10 @@ impl CanvasState {
             .and_then(|book| book.hit_cell(world));
         let mut selection_delta = None;
         let mut sheet_delta = None;
+        let mut grow_at = None;
+        let mut col_resize = None;
+        let mut row_resize = None;
+        let mut fill_addr = None;
         match self.interaction.as_mut() {
             Some(Interaction::Stroke(stroke)) => {
                 let should_add = stroke
@@ -1848,6 +2141,27 @@ impl CanvasState {
                 sheet_delta = Some(Point::new(world.x - last_world.x, world.y - last_world.y));
                 *last_world = world;
             }
+            Some(Interaction::SheetGrow { .. }) => grow_at = Some(world),
+            Some(Interaction::SheetColResize {
+                col,
+                start_x,
+                width_before,
+            }) => {
+                col_resize = Some((*col, *width_before + (world.x - *start_x)));
+            }
+            Some(Interaction::SheetRowResize {
+                row,
+                start_y,
+                height_before,
+            }) => {
+                row_resize = Some((*row, *height_before + (world.y - *start_y)));
+            }
+            Some(Interaction::SheetFill { current, .. }) => {
+                if let Some(addr) = sheet_hit {
+                    *current = addr;
+                    fill_addr = Some(addr);
+                }
+            }
             Some(Interaction::Erase) => self.erase_at(world),
             None => {}
         }
@@ -1859,6 +2173,27 @@ impl CanvasState {
         {
             book.origin.x += delta.x;
             book.origin.y += delta.y;
+        }
+        if let Some(point) = grow_at
+            && let Some(book) = self.active_layer_mut().spreadsheet.as_mut()
+        {
+            let (cols, rows) = book.visible_size_at(point);
+            book.active_mut().set_visible_size(cols, rows);
+        }
+        if let Some((col, width)) = col_resize
+            && let Some(book) = self.active_layer_mut().spreadsheet.as_mut()
+        {
+            book.active_mut().set_col_width(col, width);
+        }
+        if let Some((row, height)) = row_resize
+            && let Some(book) = self.active_layer_mut().spreadsheet.as_mut()
+        {
+            book.active_mut().set_row_height(row, height);
+        }
+        if let Some(addr) = fill_addr
+            && let Some(Interaction::SheetFill { source, .. }) = &self.interaction
+        {
+            self.sheet_range = Some(CellRange::new(source.start, addr));
         }
     }
 
@@ -1956,6 +2291,70 @@ impl CanvasState {
                     before.2.origin = origin_before;
                     self.push_spreadsheet_history(before);
                     self.dirty = true;
+                }
+            }
+            Interaction::SheetGrow {
+                cols_before,
+                rows_before,
+            } => {
+                let changed = self
+                    .active_layer()
+                    .spreadsheet
+                    .as_ref()
+                    .is_some_and(|book| {
+                        book.active().display_cols() != cols_before
+                            || book.active().display_rows() != rows_before
+                    });
+                if changed && let Some(mut stored) = self.capture_spreadsheet() {
+                    if let Some(sheet) = stored.2.sheets.get_mut(stored.2.active_sheet) {
+                        sheet.visible_cols = cols_before;
+                        sheet.visible_rows = rows_before;
+                    }
+                    self.push_spreadsheet_history(stored);
+                    self.dirty = true;
+                }
+            }
+            Interaction::SheetColResize {
+                col, width_before, ..
+            } => {
+                let current = self
+                    .active_layer()
+                    .spreadsheet
+                    .as_ref()
+                    .map(|book| book.active().col_width(col));
+                if current.is_some_and(|width| (width - width_before).abs() > 0.5)
+                    && let Some(mut stored) = self.capture_spreadsheet()
+                {
+                    if let Some(sheet) = stored.2.sheets.get_mut(stored.2.active_sheet) {
+                        sheet.set_col_width(col, width_before);
+                    }
+                    self.push_spreadsheet_history(stored);
+                    self.dirty = true;
+                }
+            }
+            Interaction::SheetRowResize {
+                row, height_before, ..
+            } => {
+                let current = self
+                    .active_layer()
+                    .spreadsheet
+                    .as_ref()
+                    .map(|book| book.active().row_height(row));
+                if current.is_some_and(|height| (height - height_before).abs() > 0.5)
+                    && let Some(mut stored) = self.capture_spreadsheet()
+                {
+                    if let Some(sheet) = stored.2.sheets.get_mut(stored.2.active_sheet) {
+                        sheet.set_row_height(row, height_before);
+                    }
+                    self.push_spreadsheet_history(stored);
+                    self.dirty = true;
+                }
+            }
+            Interaction::SheetFill { source, current } => {
+                let target = CellRange::new(source.start, current);
+                self.sheet_range = Some(target);
+                if target != source {
+                    self.fill_sheet_range(source, target);
                 }
             }
         }
@@ -2542,6 +2941,23 @@ fn stroke_grid_lines(
     let _ = context.stroke();
 }
 
+fn fill_handle_rect(bounds: Rect) -> Rect {
+    Rect {
+        x: bounds.x + bounds.width - 5.0,
+        y: bounds.y + bounds.height - 5.0,
+        width: 8.0,
+        height: 8.0,
+    }
+}
+
+fn hit_fill_handle(book: &Spreadsheet, range: CellRange, point: Point) -> bool {
+    let handle = fill_handle_rect(book.cell_rect(range.start).union(book.cell_rect(range.end)));
+    point.x >= handle.x
+        && point.x <= handle.x + handle.width
+        && point.y >= handle.y
+        && point.y <= handle.y + handle.height
+}
+
 fn draw_spreadsheet(
     context: &Context,
     state: &CanvasState,
@@ -2576,13 +2992,15 @@ fn draw_spreadsheet(
     context.set_font_size(12.0);
     context.move_to((bounds.x + 10.0) as f64, (bounds.y + 17.0) as f64);
     let _ = context.show_text(&format!(
-        "{} · {}",
+        "{} · {}×{} · {}",
         sheet.name,
+        sheet.display_cols(),
+        sheet.display_rows(),
         if active { "editing" } else { "spreadsheet" }
     ));
 
-    let cols = sheet.display_cols().min(48);
-    let rows = sheet.display_rows().min(80);
+    let cols = sheet.display_cols();
+    let rows = sheet.display_rows();
     let header_top = bounds.y + crate::spreadsheet::TITLE_HEIGHT;
     context.set_font_size(10.0);
     context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
@@ -2732,7 +3150,26 @@ fn draw_spreadsheet(
             highlight.height as f64,
         );
         let _ = context.stroke();
+        let handle = fill_handle_rect(highlight);
+        context.set_source_rgb(0.12, 0.46, 0.28);
+        context.rectangle(
+            handle.x as f64,
+            handle.y as f64,
+            handle.width as f64,
+            handle.height as f64,
+        );
+        let _ = context.fill();
     }
+
+    let grow = book.grow_handle_rect();
+    context.set_source_rgb(0.18, 0.42, 0.28);
+    context.rectangle(
+        grow.x as f64,
+        grow.y as f64,
+        grow.width as f64,
+        grow.height as f64,
+    );
+    let _ = context.fill();
 
     let tab_top = bounds.y + bounds.height - crate::spreadsheet::TAB_HEIGHT;
     context.set_source_rgb(0.94, 0.95, 0.94);
@@ -2805,24 +3242,34 @@ fn draw_interaction(context: &Context, state: &CanvasState) {
         | Some(Interaction::Pan { .. })
         | Some(Interaction::Erase)
         | Some(Interaction::SheetMove { .. })
+        | Some(Interaction::SheetGrow { .. })
+        | Some(Interaction::SheetColResize { .. })
+        | Some(Interaction::SheetRowResize { .. })
         | None => {}
         Some(Interaction::SheetSelect { start, current }) => {
-            if let Some(book) = state.active_layer().spreadsheet.as_ref() {
-                let range = CellRange::new(*start, *current);
-                let a = book.cell_rect(range.start);
-                let b = book.cell_rect(range.end);
-                let bounds = a.union(b);
-                context.set_source_rgba(0.12, 0.46, 0.28, 0.16);
-                context.rectangle(
-                    bounds.x as f64,
-                    bounds.y as f64,
-                    bounds.width as f64,
-                    bounds.height as f64,
-                );
-                let _ = context.fill();
-            }
+            draw_sheet_range_preview(context, state, CellRange::new(*start, *current));
+        }
+        Some(Interaction::SheetFill { source, current }) => {
+            draw_sheet_range_preview(context, state, CellRange::new(source.start, *current));
         }
     }
+}
+
+fn draw_sheet_range_preview(context: &Context, state: &CanvasState, range: CellRange) {
+    let Some(book) = state.active_layer().spreadsheet.as_ref() else {
+        return;
+    };
+    let a = book.cell_rect(range.start);
+    let b = book.cell_rect(range.end);
+    let bounds = a.union(b);
+    context.set_source_rgba(0.12, 0.46, 0.28, 0.16);
+    context.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        bounds.height as f64,
+    );
+    let _ = context.fill();
 }
 
 fn draw_selection(context: &Context, state: &CanvasState) {

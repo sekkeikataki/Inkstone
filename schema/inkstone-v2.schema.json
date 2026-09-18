@@ -305,7 +305,9 @@
           "items": { "type": "string" }
         },
         "frozen_rows": { "type": "integer", "minimum": 0 },
-        "frozen_cols": { "type": "integer", "minimum": 0 }
+        "frozen_cols": { "type": "integer", "minimum": 0 },
+        "visible_cols": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "visible_rows": { "type": "integer", "minimum": 1, "maximum": 1048576 }
       }
     },
     "sheetCell": {

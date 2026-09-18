@@ -1350,6 +1350,83 @@ fn eval_call(name: &str, args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
             Value::Error(_) => Value::Number(16.0),
             Value::Array(_) => Value::Number(64.0),
         },
+        "SUMIFS" => eval_multi_conditional(args, ctx, CondKind::Sum),
+        "COUNTIFS" => eval_countifs(args, ctx),
+        "AVERAGEIFS" => eval_multi_conditional(args, ctx, CondKind::Average),
+        "SUMPRODUCT" => eval_sumproduct(args, ctx),
+        "IFS" => eval_ifs(args, ctx),
+        "SWITCH" => eval_switch(args, ctx),
+        "TEXTJOIN" => eval_textjoin(args, ctx),
+        "PROPER" => text_map(args, ctx, proper_case),
+        "REPLACE" => eval_replace(args, ctx),
+        "CHAR" => match arg1(args, ctx).and_then(|v| v.as_number()) {
+            Ok(code) => {
+                let code = code.round() as u32;
+                char::from_u32(code)
+                    .map(|ch| Value::Text(ch.to_string()))
+                    .unwrap_or(Value::Error(ErrorKind::Value))
+            }
+            Err(kind) => Value::Error(kind),
+        },
+        "CODE" => match arg1(args, ctx).and_then(|v| v.as_text()) {
+            Ok(text) => text
+                .chars()
+                .next()
+                .map(|ch| Value::Number(u32::from(ch) as f64))
+                .unwrap_or(Value::Error(ErrorKind::Value)),
+            Err(kind) => Value::Error(kind),
+        },
+        "RAND" => Value::Number(volatile_rand(ctx, 1.0)),
+        "RANDBETWEEN" => match (
+            arg_at(args, 0, ctx).and_then(|v| v.as_number()),
+            arg_at(args, 1, ctx).and_then(|v| v.as_number()),
+        ) {
+            (Ok(lo), Ok(hi)) => {
+                let lo = lo.round() as i64;
+                let hi = hi.round() as i64;
+                if hi < lo {
+                    Value::Error(ErrorKind::Num)
+                } else {
+                    let span = (hi - lo + 1) as f64;
+                    Value::Number(lo as f64 + (volatile_rand(ctx, span) * span).floor())
+                }
+            }
+            (Err(kind), _) | (_, Err(kind)) => Value::Error(kind),
+        },
+        "FACT" => unary_num_checked(args, ctx, |n| {
+            if n < 0.0 || n > 170.0 {
+                Err(ErrorKind::Num)
+            } else {
+                Ok((1..=n.round() as u32).map(f64::from).product())
+            }
+        }),
+        "GCD" => gcd_lcm(args, ctx, true),
+        "LCM" => gcd_lcm(args, ctx, false),
+        "EVEN" => unary_num(args, ctx, excel_even),
+        "ODD" => unary_num(args, ctx, excel_odd),
+        "VAR" | "VAR.S" | "VARS" => stdev_var(args, ctx, true, true),
+        "VAR.P" | "VARP" => stdev_var(args, ctx, true, false),
+        "PMT" => eval_pmt(args, ctx),
+        "FV" => eval_fv(args, ctx),
+        "PV" => eval_pv(args, ctx),
+        "NPV" => eval_npv(args, ctx),
+        "DATEDIF" => eval_datedif(args, ctx),
+        "EDATE" => eval_edate(args, ctx, false),
+        "EOMONTH" => eval_edate(args, ctx, true),
+        "WEEKDAY" => eval_weekday(args, ctx),
+        "TIME" => eval_time(args, ctx),
+        "HOUR" => time_part(args, ctx, 0),
+        "MINUTE" => time_part(args, ctx, 1),
+        "SECOND" => time_part(args, ctx, 2),
+        "TRANSPOSE" => eval_transpose(args, ctx),
+        "SEQUENCE" => eval_sequence(args, ctx),
+        "LOOKUP" => eval_lookup(args, ctx, true),
+        "ISLOGICAL" => Value::Bool(matches!(eval_optional(args, 0, ctx), Value::Bool(_))),
+        "ISERR" => {
+            let err = eval_optional(args, 0, ctx).error();
+            Value::Bool(err.is_some() && err != Some(ErrorKind::Na))
+        }
+        "ISFORMULA" => eval_isformula(args, ctx),
         _ => {
             let _ = values;
             Value::Error(ErrorKind::Name)
@@ -2376,4 +2453,618 @@ fn civil_from_days(mut z: i64) -> (i32, u32, u32) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     (year + i32::from(month <= 2), month, day)
+}
+
+fn eval_countifs(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
+        return Value::Error(ErrorKind::Value);
+    }
+    let Ok(first) = eval_optional(args, 0, ctx).flatten() else {
+        return Value::Error(ErrorKind::Value);
+    };
+    let mut pairs = vec![(first, eval_optional(args, 1, ctx))];
+    let mut index = 2;
+    while index + 1 < args.len() {
+        let Ok(tests) = eval_optional(args, index, ctx).flatten() else {
+            return Value::Error(ErrorKind::Value);
+        };
+        if tests.len() != pairs[0].0.len() {
+            return Value::Error(ErrorKind::Value);
+        }
+        pairs.push((tests, eval_optional(args, index + 1, ctx)));
+        index += 2;
+    }
+    let count = (0..pairs[0].0.len())
+        .filter(|slot| {
+            pairs.iter().all(|(tests, criteria)| {
+                tests
+                    .get(*slot)
+                    .is_some_and(|test| criteria_match(test, criteria))
+            })
+        })
+        .count();
+    Value::Number(count as f64)
+}
+
+fn eval_multi_conditional(args: &[Expr], ctx: &mut EvalContext<'_>, kind: CondKind) -> Value {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
+        return Value::Error(ErrorKind::Value);
+    }
+    let values = eval_optional(args, 0, ctx);
+    let Ok(nums) = values.flatten() else {
+        return Value::Error(ErrorKind::Value);
+    };
+    let mut pairs = Vec::new();
+    let mut index = 1;
+    while index + 1 < args.len() {
+        let Ok(tests) = eval_optional(args, index, ctx).flatten() else {
+            return Value::Error(ErrorKind::Value);
+        };
+        let criteria = eval_optional(args, index + 1, ctx);
+        if tests.len() != nums.len() {
+            return Value::Error(ErrorKind::Value);
+        }
+        pairs.push((tests, criteria));
+        index += 2;
+    }
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for (slot, value) in nums.iter().enumerate() {
+        if pairs.iter().all(|(tests, criteria)| {
+            tests
+                .get(slot)
+                .is_some_and(|test| criteria_match(test, criteria))
+        }) {
+            match kind {
+                CondKind::Count => count += 1,
+                CondKind::Sum | CondKind::Average => {
+                    if let Ok(number) = value.as_number() {
+                        sum += number;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    match kind {
+        CondKind::Count => Value::Number(count as f64),
+        CondKind::Sum => Value::number(sum),
+        CondKind::Average if count == 0 => Value::Error(ErrorKind::Div0),
+        CondKind::Average => Value::number(sum / count as f64),
+    }
+}
+
+fn eval_sumproduct(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    if args.is_empty() {
+        return Value::Error(ErrorKind::Value);
+    }
+    let arrays: Vec<Vec<Value>> = args
+        .iter()
+        .map(|arg| eval_expr(arg, ctx).flatten())
+        .collect::<Result<_, _>>()
+        .unwrap_or_default();
+    if arrays.is_empty() || arrays.iter().any(|a| a.len() != arrays[0].len()) {
+        return Value::Error(ErrorKind::Value);
+    }
+    let mut sum = 0.0;
+    for i in 0..arrays[0].len() {
+        let mut product = 1.0;
+        for array in &arrays {
+            match array[i].as_number() {
+                Ok(number) => product *= number,
+                Err(kind) => return Value::Error(kind),
+            }
+        }
+        sum += product;
+    }
+    Value::number(sum)
+}
+
+fn eval_ifs(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Value::Error(ErrorKind::Na);
+    }
+    let mut index = 0;
+    while index + 1 < args.len() {
+        match eval_optional(args, index, ctx).is_truthy() {
+            Ok(true) => return eval_optional(args, index + 1, ctx),
+            Ok(false) => index += 2,
+            Err(kind) => return Value::Error(kind),
+        }
+    }
+    Value::Error(ErrorKind::Na)
+}
+
+fn eval_switch(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ErrorKind::Value);
+    }
+    let expr = eval_optional(args, 0, ctx);
+    let mut index = 1;
+    while index + 1 < args.len() {
+        let candidate = eval_optional(args, index, ctx);
+        if excel_equal(&expr, &candidate) {
+            return eval_optional(args, index + 1, ctx);
+        }
+        index += 2;
+    }
+    if args.len().is_multiple_of(2) {
+        eval_optional(args, args.len() - 1, ctx)
+    } else {
+        Value::Error(ErrorKind::Na)
+    }
+}
+
+fn eval_textjoin(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let delimiter = match arg_at(args, 0, ctx).and_then(|v| v.as_text()) {
+        Ok(text) => text,
+        Err(kind) => return Value::Error(kind),
+    };
+    let skip_empty = match arg_at(args, 1, ctx).and_then(|v| v.as_bool()) {
+        Ok(value) => value,
+        Err(kind) => return Value::Error(kind),
+    };
+    let mut parts = Vec::new();
+    for arg in args.iter().skip(2) {
+        match eval_expr(arg, ctx).flatten() {
+            Ok(values) => {
+                for value in values {
+                    match value.as_text() {
+                        Ok(text) if !(skip_empty && text.is_empty()) => parts.push(text),
+                        Ok(_) => {}
+                        Err(kind) => return Value::Error(kind),
+                    }
+                }
+            }
+            Err(kind) => return Value::Error(kind),
+        }
+    }
+    Value::Text(parts.join(&delimiter))
+}
+
+fn proper_case(input: String) -> String {
+    let mut out = String::new();
+    let mut start = true;
+    for ch in input.chars() {
+        if ch.is_alphanumeric() {
+            if start {
+                out.extend(ch.to_uppercase());
+                start = false;
+            } else {
+                out.extend(ch.to_lowercase());
+            }
+        } else {
+            out.push(ch);
+            start = true;
+        }
+    }
+    out
+}
+
+fn eval_replace(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    match (
+        arg_at(args, 0, ctx).and_then(|v| v.as_text()),
+        arg_at(args, 1, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 2, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 3, ctx).and_then(|v| v.as_text()),
+    ) {
+        (Ok(text), Ok(start), Ok(len), Ok(new)) => {
+            if start < 1.0 || len < 0.0 {
+                return Value::Error(ErrorKind::Value);
+            }
+            let chars: Vec<char> = text.chars().collect();
+            let start = (start as usize).saturating_sub(1);
+            let end = (start + len as usize).min(chars.len());
+            let mut out: String = chars.iter().take(start).collect();
+            out.push_str(&new);
+            out.extend(chars.iter().skip(end));
+            Value::Text(out)
+        }
+        (Err(kind), _, _, _)
+        | (_, Err(kind), _, _)
+        | (_, _, Err(kind), _)
+        | (_, _, _, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn volatile_rand(ctx: &EvalContext<'_>, _span: f64) -> f64 {
+    let mut seed = 0x9E37_79B9_u64
+        .wrapping_add(ctx.sheet_index as u64)
+        .wrapping_mul(0x0100_0000_01B3)
+        .wrapping_add(u64::from(ctx.current.col))
+        .wrapping_mul(0xC2B2_AE3D)
+        .wrapping_add(u64::from(ctx.current.row));
+    if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        seed ^= duration.subsec_nanos() as u64;
+    }
+    seed ^= seed >> 30;
+    seed = seed.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    seed ^= seed >> 27;
+    (seed as f64) / (u64::MAX as f64)
+}
+
+fn excel_even(n: f64) -> f64 {
+    if n >= 0.0 {
+        let c = n.ceil();
+        if (c as i64) % 2 == 0 { c } else { c + 1.0 }
+    } else {
+        let f = n.floor();
+        if (f as i64) % 2 == 0 { f } else { f - 1.0 }
+    }
+}
+
+fn excel_odd(n: f64) -> f64 {
+    if n >= 0.0 {
+        let c = n.ceil();
+        if (c as i64) % 2 == 0 { c + 1.0 } else { c }
+    } else {
+        let f = n.floor();
+        if (f as i64) % 2 == 0 { f - 1.0 } else { f }
+    }
+}
+
+fn gcd_lcm(args: &[Expr], ctx: &mut EvalContext<'_>, gcd: bool) -> Value {
+    let (values, _) = fold_numbers(args, ctx);
+    let mut ints: Vec<i64> = Vec::new();
+    for arg in args {
+        if let Ok(flat) = eval_expr(arg, ctx).flatten() {
+            for value in flat {
+                if let Ok(number) = value.as_number() {
+                    ints.push(number.round().abs() as i64);
+                }
+            }
+        }
+    }
+    if ints.is_empty() {
+        return Value::Error(ErrorKind::Value);
+    }
+    let result = if gcd {
+        ints.into_iter().reduce(gcd_i64).unwrap_or(0)
+    } else {
+        ints.into_iter().reduce(lcm_i64).unwrap_or(0)
+    };
+    let _ = values;
+    Value::Number(result as f64)
+}
+
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.abs()
+}
+
+fn lcm_i64(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        0
+    } else {
+        (a / gcd_i64(a, b)).saturating_mul(b).abs()
+    }
+}
+
+fn stdev_var(args: &[Expr], ctx: &mut EvalContext<'_>, variance: bool, sample: bool) -> Value {
+    let mut nums = Vec::new();
+    for arg in args {
+        if let Ok(flat) = eval_expr(arg, ctx).flatten() {
+            for value in flat {
+                if matches!(value, Value::Number(_) | Value::Bool(_))
+                    && let Ok(number) = value.as_number()
+                {
+                    nums.push(number);
+                }
+            }
+        }
+    }
+    let n = nums.len();
+    let denom = if sample { n.saturating_sub(1) } else { n };
+    if denom == 0 {
+        return Value::Error(ErrorKind::Div0);
+    }
+    let mean = nums.iter().sum::<f64>() / n as f64;
+    let var = nums.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / denom as f64;
+    if variance {
+        Value::number(var)
+    } else {
+        Value::number(var.sqrt())
+    }
+}
+
+fn eval_pmt(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let rate = arg_at(args, 0, ctx).and_then(|v| v.as_number());
+    let nper = arg_at(args, 1, ctx).and_then(|v| v.as_number());
+    let pv = arg_at(args, 2, ctx).and_then(|v| v.as_number());
+    match (rate, nper, pv) {
+        (Ok(rate), Ok(nper), Ok(pv)) => {
+            let fv = eval_optional(args, 3, ctx).as_number().unwrap_or(0.0);
+            let type_end = eval_optional(args, 4, ctx).as_number().unwrap_or(0.0);
+            if nper == 0.0 {
+                return Value::Error(ErrorKind::Div0);
+            }
+            if rate == 0.0 {
+                return Value::number(-(pv + fv) / nper);
+            }
+            let pow = (1.0 + rate).powf(nper);
+            Value::number(-(rate * (pv * pow + fv)) / ((1.0 + rate * type_end) * (pow - 1.0)))
+        }
+        (Err(kind), _, _) | (_, Err(kind), _) | (_, _, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn eval_fv(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let rate = arg_at(args, 0, ctx).and_then(|v| v.as_number());
+    let nper = arg_at(args, 1, ctx).and_then(|v| v.as_number());
+    let pmt = arg_at(args, 2, ctx).and_then(|v| v.as_number());
+    match (rate, nper, pmt) {
+        (Ok(rate), Ok(nper), Ok(pmt)) => {
+            let pv = eval_optional(args, 3, ctx).as_number().unwrap_or(0.0);
+            let type_end = eval_optional(args, 4, ctx).as_number().unwrap_or(0.0);
+            if rate == 0.0 {
+                return Value::number(-(pv + pmt * nper));
+            }
+            let pow = (1.0 + rate).powf(nper);
+            Value::number(-pv * pow - pmt * (1.0 + rate * type_end) * (pow - 1.0) / rate)
+        }
+        (Err(kind), _, _) | (_, Err(kind), _) | (_, _, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn eval_pv(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let rate = arg_at(args, 0, ctx).and_then(|v| v.as_number());
+    let nper = arg_at(args, 1, ctx).and_then(|v| v.as_number());
+    let pmt = arg_at(args, 2, ctx).and_then(|v| v.as_number());
+    match (rate, nper, pmt) {
+        (Ok(rate), Ok(nper), Ok(pmt)) => {
+            let fv = eval_optional(args, 3, ctx).as_number().unwrap_or(0.0);
+            let type_end = eval_optional(args, 4, ctx).as_number().unwrap_or(0.0);
+            if rate == 0.0 {
+                return Value::number(-(fv + pmt * nper));
+            }
+            let pow = (1.0 + rate).powf(nper);
+            Value::number((-fv - pmt * (1.0 + rate * type_end) * (pow - 1.0) / rate) / pow)
+        }
+        (Err(kind), _, _) | (_, Err(kind), _) | (_, _, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn eval_npv(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let rate = match arg_at(args, 0, ctx).and_then(|v| v.as_number()) {
+        Ok(rate) => rate,
+        Err(kind) => return Value::Error(kind),
+    };
+    let mut npv = 0.0;
+    let mut period = 1.0;
+    for arg in args.iter().skip(1) {
+        match eval_expr(arg, ctx).flatten() {
+            Ok(values) => {
+                for value in values {
+                    match value.as_number() {
+                        Ok(cash) => {
+                            npv += cash / (1.0 + rate).powf(period);
+                            period += 1.0;
+                        }
+                        Err(kind) => return Value::Error(kind),
+                    }
+                }
+            }
+            Err(kind) => return Value::Error(kind),
+        }
+    }
+    Value::number(npv)
+}
+
+fn eval_datedif(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    match (
+        arg_at(args, 0, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 1, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 2, ctx).and_then(|v| v.as_text()),
+    ) {
+        (Ok(start), Ok(end), Ok(unit)) => {
+            if end < start {
+                return Value::Error(ErrorKind::Num);
+            }
+            let Some((sy, sm, sd)) = serial_to_ymd(start.floor() as i64) else {
+                return Value::Error(ErrorKind::Num);
+            };
+            let Some((ey, em, ed)) = serial_to_ymd(end.floor() as i64) else {
+                return Value::Error(ErrorKind::Num);
+            };
+            let value = match unit.to_ascii_uppercase().as_str() {
+                "Y" => (ey - sy - i32::from(em < sm || (em == sm && ed < sd))) as f64,
+                "M" => {
+                    let mut months = (ey - sy) * 12 + (em - sm);
+                    if ed < sd {
+                        months -= 1;
+                    }
+                    months as f64
+                }
+                "D" => end.floor() - start.floor(),
+                "YM" => {
+                    let mut months = (em - sm + 12) % 12;
+                    if ed < sd {
+                        months = (months + 11) % 12;
+                    }
+                    months as f64
+                }
+                "MD" => {
+                    let mut day = ed - sd;
+                    if day < 0 {
+                        day += 30;
+                    }
+                    day as f64
+                }
+                "YD" => ((end.floor() - start.floor()) as i64 % 365) as f64,
+                _ => return Value::Error(ErrorKind::Num),
+            };
+            Value::Number(value)
+        }
+        (Err(kind), _, _) | (_, Err(kind), _) | (_, _, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn eval_edate(args: &[Expr], ctx: &mut EvalContext<'_>, eomonth: bool) -> Value {
+    match (
+        arg_at(args, 0, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 1, ctx).and_then(|v| v.as_number()),
+    ) {
+        (Ok(serial), Ok(months)) => {
+            let Some((year, month, day)) = serial_to_ymd(serial.floor() as i64) else {
+                return Value::Error(ErrorKind::Num);
+            };
+            let total = year * 12 + month - 1 + months.round() as i32;
+            let year = total.div_euclid(12);
+            let month = total.rem_euclid(12) + 1;
+            let last = last_day_of_month(year, month as u32);
+            let day = if eomonth {
+                last as i32
+            } else {
+                day.min(last as i32)
+            };
+            ymd_to_serial(year, month, day)
+                .map(|value| Value::Number(value as f64))
+                .unwrap_or(Value::Error(ErrorKind::Num))
+        }
+        (Err(kind), _) | (_, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn eval_weekday(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    match arg1(args, ctx).and_then(|v| v.as_number()) {
+        Ok(serial) => {
+            let return_type = eval_optional(args, 1, ctx)
+                .as_number()
+                .unwrap_or(1.0)
+                .round() as i32;
+            let weekday = ((serial.floor() as i64 + 6) % 7) as i32; // 0=Sun
+            let value = match return_type {
+                1 => weekday + 1,
+                2 => {
+                    if weekday == 0 {
+                        7
+                    } else {
+                        weekday
+                    }
+                }
+                3 => {
+                    if weekday == 0 {
+                        6
+                    } else {
+                        weekday - 1
+                    }
+                }
+                _ => weekday + 1,
+            };
+            Value::Number(value as f64)
+        }
+        Err(kind) => Value::Error(kind),
+    }
+}
+
+fn eval_time(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    match (
+        arg_at(args, 0, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 1, ctx).and_then(|v| v.as_number()),
+        arg_at(args, 2, ctx).and_then(|v| v.as_number()),
+    ) {
+        (Ok(h), Ok(m), Ok(s)) => {
+            let fraction = (h * 3600.0 + m * 60.0 + s) / 86_400.0;
+            Value::number(fraction.rem_euclid(1.0))
+        }
+        (Err(kind), _, _) | (_, Err(kind), _) | (_, _, Err(kind)) => Value::Error(kind),
+    }
+}
+
+fn time_part(args: &[Expr], ctx: &mut EvalContext<'_>, part: u8) -> Value {
+    match arg1(args, ctx).and_then(|v| v.as_number()) {
+        Ok(serial) => {
+            let mut seconds = ((serial.fract().abs() * 86_400.0).round() as i64).rem_euclid(86_400);
+            let hour = seconds / 3600;
+            seconds %= 3600;
+            let minute = seconds / 60;
+            let second = seconds % 60;
+            Value::Number(match part {
+                0 => hour as f64,
+                1 => minute as f64,
+                _ => second as f64,
+            })
+        }
+        Err(kind) => Value::Error(kind),
+    }
+}
+
+fn eval_transpose(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    match eval_optional(args, 0, ctx) {
+        Value::Array(rows) => {
+            let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+            let mut cols = vec![Vec::new(); width];
+            for row in rows {
+                for (index, value) in row.into_iter().enumerate() {
+                    cols[index].push(value);
+                }
+            }
+            Value::Array(cols)
+        }
+        other => other,
+    }
+}
+
+fn eval_sequence(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let rows = arg_at(args, 0, ctx)
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0)
+        .round() as i32;
+    let cols = if args.len() > 1 {
+        arg_at(args, 1, ctx)
+            .and_then(|v| v.as_number())
+            .unwrap_or(1.0)
+            .round() as i32
+    } else {
+        1
+    };
+    let start = eval_optional(args, 2, ctx).as_number().unwrap_or(1.0);
+    let step = eval_optional(args, 3, ctx).as_number().unwrap_or(1.0);
+    if rows <= 0 || cols <= 0 {
+        return Value::Error(ErrorKind::Num);
+    }
+    let mut value = start;
+    let mut grid = Vec::new();
+    for _ in 0..rows {
+        let mut row = Vec::new();
+        for _ in 0..cols {
+            row.push(Value::Number(value));
+            value += step;
+        }
+        grid.push(row);
+    }
+    if grid.len() == 1 && grid[0].len() == 1 {
+        grid[0][0].clone()
+    } else {
+        Value::Array(grid)
+    }
+}
+
+fn eval_isformula(args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
+    let (sheet, addr) = match args.first() {
+        Some(Expr::Ref { sheet, cell }) => (sheet.clone(), cell.addr()),
+        _ => return Value::Bool(false),
+    };
+    let Some(index) = resolve_sheet(ctx, sheet.as_deref()) else {
+        return Value::Bool(false);
+    };
+    Value::Bool(
+        ctx.sheets
+            .get(index)
+            .and_then(|sheet| sheet.cells.get(&addr))
+            .is_some_and(|cell| cell.is_formula()),
+    )
 }

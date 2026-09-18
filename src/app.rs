@@ -1519,6 +1519,86 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
         let canvas = canvas.clone();
         move |_| canvas.fill_sheet_selection()
     });
+    let italic = gtk::Button::builder()
+        .label("I")
+        .tooltip_text("Italic selected cells (Ctrl+I)")
+        .build();
+    italic.add_css_class("flat");
+    italic.add_css_class("pill");
+    italic.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.toggle_sheet_italic()
+    });
+    let percent = gtk::Button::builder()
+        .label("%/$")
+        .tooltip_text("Cycle number, percent, currency, and date formats")
+        .build();
+    percent.add_css_class("flat");
+    percent.add_css_class("pill");
+    percent.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.cycle_number_format()
+    });
+    let merge = gtk::Button::builder()
+        .label("Merge")
+        .tooltip_text("Merge the selected cells")
+        .build();
+    merge.add_css_class("flat");
+    merge.add_css_class("pill");
+    merge.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.merge_sheet_selection()
+    });
+    let sort = gtk::Button::builder()
+        .label("A↓")
+        .tooltip_text("Sort the selection by the first column")
+        .build();
+    sort.add_css_class("flat");
+    sort.add_css_class("pill");
+    sort.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.sort_sheet_selection()
+    });
+    let add_cols = gtk::Button::builder()
+        .label("+Col")
+        .tooltip_text("Add five columns to the right of the grid")
+        .build();
+    add_cols.add_css_class("flat");
+    add_cols.add_css_class("pill");
+    add_cols.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.add_sheet_cols()
+    });
+    let add_rows = gtk::Button::builder()
+        .label("+Row")
+        .tooltip_text("Add five rows to the bottom of the grid")
+        .build();
+    add_rows.add_css_class("flat");
+    add_rows.add_css_class("pill");
+    add_rows.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.add_sheet_rows()
+    });
+    let insert_col = gtk::Button::builder()
+        .label("Ins C")
+        .tooltip_text("Insert a column at the selection")
+        .build();
+    insert_col.add_css_class("flat");
+    insert_col.add_css_class("pill");
+    insert_col.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.insert_sheet_col()
+    });
+    let insert_row = gtk::Button::builder()
+        .label("Ins R")
+        .tooltip_text("Insert a row at the selection")
+        .build();
+    insert_row.add_css_class("flat");
+    insert_row.add_css_class("pill");
+    insert_row.connect_clicked({
+        let canvas = canvas.clone();
+        move |_| canvas.insert_sheet_row()
+    });
     let sheet = gtk::Button::builder()
         .label("Sheet")
         .tooltip_text("Add a worksheet tab")
@@ -1532,12 +1612,28 @@ fn spreadsheet_options(canvas: &Canvas) -> (gtk::Box, gtk::Entry, gtk::Entry) {
     row.append(&option_hint("fx"));
     row.append(&addr);
     row.append(&formula);
-    row.append(&bold);
-    row.append(&align);
-    row.append(&fill);
-    row.append(&sheet);
-    row.append(&sheet_fill_colors(canvas));
-    (row, addr, formula)
+    let tools = option_row();
+    tools.append(&bold);
+    tools.append(&italic);
+    tools.append(&align);
+    tools.append(&percent);
+    tools.append(&fill);
+    tools.append(&merge);
+    tools.append(&sort);
+    tools.append(&add_cols);
+    tools.append(&add_rows);
+    tools.append(&insert_col);
+    tools.append(&insert_row);
+    tools.append(&sheet);
+    tools.append(&sheet_fill_colors(canvas));
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .halign(gtk::Align::Center)
+        .build();
+    column.append(&row);
+    column.append(&tools);
+    (column, addr, formula)
 }
 
 fn hint_options(text: &str) -> gtk::Box {

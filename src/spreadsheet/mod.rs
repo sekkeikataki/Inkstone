@@ -17,8 +17,9 @@ pub const HEADER_COL_WIDTH: f32 = 36.0;
 pub const HEADER_ROW_HEIGHT: f32 = 22.0;
 pub const TITLE_HEIGHT: f32 = 26.0;
 pub const TAB_HEIGHT: f32 = 22.0;
-pub const MIN_DISPLAY_COLS: u32 = 8;
-pub const MIN_DISPLAY_ROWS: u32 = 20;
+pub const MIN_DISPLAY_COLS: u32 = 10;
+pub const MIN_DISPLAY_ROWS: u32 = 10;
+pub const GROW_HANDLE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,10 +168,36 @@ pub struct Sheet {
     pub frozen_rows: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub frozen_cols: u32,
+    #[serde(
+        default = "default_visible_cols",
+        skip_serializing_if = "is_default_visible_cols"
+    )]
+    pub visible_cols: u32,
+    #[serde(
+        default = "default_visible_rows",
+        skip_serializing_if = "is_default_visible_rows"
+    )]
+    pub visible_rows: u32,
 }
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
+}
+
+fn default_visible_cols() -> u32 {
+    MIN_DISPLAY_COLS
+}
+
+fn default_visible_rows() -> u32 {
+    MIN_DISPLAY_ROWS
+}
+
+fn is_default_visible_cols(value: &u32) -> bool {
+    *value == MIN_DISPLAY_COLS
+}
+
+fn is_default_visible_rows(value: &u32) -> bool {
+    *value == MIN_DISPLAY_ROWS
 }
 
 impl Sheet {
@@ -183,6 +210,8 @@ impl Sheet {
             merged: Vec::new(),
             frozen_rows: 0,
             frozen_cols: 0,
+            visible_cols: MIN_DISPLAY_COLS,
+            visible_rows: MIN_DISPLAY_ROWS,
         }
     }
 
@@ -228,24 +257,50 @@ impl Sheet {
         )
     }
 
-    pub fn display_cols(&self) -> u32 {
-        let used = self
-            .cells
+    pub fn used_cols(&self) -> u32 {
+        self.cells
             .keys()
             .map(|addr| addr.col + 1)
             .max()
-            .unwrap_or(0);
-        used.clamp(MIN_DISPLAY_COLS, MAX_COLS)
+            .unwrap_or(0)
     }
 
-    pub fn display_rows(&self) -> u32 {
-        let used = self
-            .cells
+    pub fn used_rows(&self) -> u32 {
+        self.cells
             .keys()
             .map(|addr| addr.row + 1)
             .max()
-            .unwrap_or(0);
-        used.clamp(MIN_DISPLAY_ROWS, MAX_ROWS)
+            .unwrap_or(0)
+    }
+
+    pub fn display_cols(&self) -> u32 {
+        self.visible_cols
+            .max(self.used_cols())
+            .clamp(MIN_DISPLAY_COLS, MAX_COLS)
+    }
+
+    pub fn display_rows(&self) -> u32 {
+        self.visible_rows
+            .max(self.used_rows())
+            .clamp(MIN_DISPLAY_ROWS, MAX_ROWS)
+    }
+
+    pub fn grow_to_include(&mut self, addr: CellAddr) {
+        self.visible_cols = self.display_cols().max(addr.col + 1).min(MAX_COLS);
+        self.visible_rows = self.display_rows().max(addr.row + 1).min(MAX_ROWS);
+    }
+
+    pub fn set_visible_size(&mut self, cols: u32, rows: u32) {
+        self.visible_cols = cols.max(self.used_cols()).clamp(MIN_DISPLAY_COLS, MAX_COLS);
+        self.visible_rows = rows.max(self.used_rows()).clamp(MIN_DISPLAY_ROWS, MAX_ROWS);
+    }
+
+    pub fn add_visible_cols(&mut self, count: u32) {
+        self.visible_cols = self.display_cols().saturating_add(count).min(MAX_COLS);
+    }
+
+    pub fn add_visible_rows(&mut self, count: u32) {
+        self.visible_rows = self.display_rows().saturating_add(count).min(MAX_ROWS);
     }
 
     pub fn set_input(&mut self, addr: CellAddr, input: String) {
@@ -354,6 +409,39 @@ impl Sheet {
             copies.push((target, copy));
         }
         copies
+    }
+
+    pub fn paste_from(
+        &mut self,
+        source_origin: CellAddr,
+        cells: &[(CellAddr, Cell)],
+        dest: CellAddr,
+    ) {
+        let dcol = dest.col as i32 - source_origin.col as i32;
+        let drow = dest.row as i32 - source_origin.row as i32;
+        for (addr, cell) in cells {
+            let Some(target) = addr.offset(dcol, drow) else {
+                continue;
+            };
+            let mut copy = cell.clone();
+            if copy.is_formula() {
+                copy.input = adjust_formula(&copy.input, dcol, drow);
+            }
+            if copy.input.is_empty() && is_default_style(&copy.style) {
+                self.cells.remove(&target);
+            } else {
+                self.cells.insert(target, copy);
+            }
+            self.grow_to_include(target);
+        }
+    }
+
+    pub fn set_col_width(&mut self, col: u32, width: f32) {
+        self.column_widths.insert(col, width.clamp(24.0, 480.0));
+    }
+
+    pub fn set_row_height(&mut self, row: u32, height: f32) {
+        self.row_heights.insert(row, height.clamp(12.0, 240.0));
     }
 
     pub fn fill(&mut self, source: CellRange, target: CellRange) {
@@ -608,6 +696,122 @@ impl Spreadsheet {
             && point.y <= bounds.y + TITLE_HEIGHT
     }
 
+    pub fn hit_select_all(&self, point: Point) -> bool {
+        let header_top = self.origin.y + TITLE_HEIGHT;
+        point.x >= self.origin.x
+            && point.x < self.origin.x + HEADER_COL_WIDTH
+            && point.y >= header_top
+            && point.y < header_top + HEADER_ROW_HEIGHT
+    }
+
+    pub fn hit_col_header(&self, point: Point) -> Option<u32> {
+        let header_top = self.origin.y + TITLE_HEIGHT;
+        if point.y < header_top || point.y >= header_top + HEADER_ROW_HEIGHT {
+            return None;
+        }
+        let sheet = self.active();
+        let mut x = self.origin.x + HEADER_COL_WIDTH;
+        for col in 0..sheet.display_cols() {
+            let width = sheet.col_width(col);
+            if point.x >= x && point.x < x + width {
+                return Some(col);
+            }
+            x += width;
+        }
+        None
+    }
+
+    pub fn hit_row_header(&self, point: Point) -> Option<u32> {
+        if point.x < self.origin.x || point.x >= self.origin.x + HEADER_COL_WIDTH {
+            return None;
+        }
+        let sheet = self.active();
+        let mut y = self.origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
+        for row in 0..sheet.display_rows() {
+            let height = sheet.row_height(row);
+            if point.y >= y && point.y < y + height {
+                return Some(row);
+            }
+            y += height;
+        }
+        None
+    }
+
+    pub fn hit_col_resize(&self, point: Point) -> Option<u32> {
+        let header_top = self.origin.y + TITLE_HEIGHT;
+        if point.y < header_top || point.y >= header_top + HEADER_ROW_HEIGHT {
+            return None;
+        }
+        let sheet = self.active();
+        let mut x = self.origin.x + HEADER_COL_WIDTH;
+        for col in 0..sheet.display_cols() {
+            x += sheet.col_width(col);
+            if (point.x - x).abs() <= 4.0 {
+                return Some(col);
+            }
+        }
+        None
+    }
+
+    pub fn hit_row_resize(&self, point: Point) -> Option<u32> {
+        if point.x < self.origin.x || point.x >= self.origin.x + HEADER_COL_WIDTH {
+            return None;
+        }
+        let sheet = self.active();
+        let mut y = self.origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
+        for row in 0..sheet.display_rows() {
+            y += sheet.row_height(row);
+            if (point.y - y).abs() <= 4.0 {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn hit_grow_handle(&self, point: Point) -> bool {
+        let handle = self.grow_handle_rect();
+        point.x >= handle.x
+            && point.x <= handle.x + handle.width
+            && point.y >= handle.y
+            && point.y <= handle.y + handle.height
+    }
+
+    pub fn grow_handle_rect(&self) -> Rect {
+        let bounds = self.bounds();
+        let grid_bottom = bounds.y + bounds.height - TAB_HEIGHT;
+        Rect {
+            x: bounds.x + bounds.width - GROW_HANDLE,
+            y: grid_bottom - GROW_HANDLE,
+            width: GROW_HANDLE,
+            height: GROW_HANDLE,
+        }
+    }
+
+    pub fn visible_size_at(&self, point: Point) -> (u32, u32) {
+        let sheet = self.active();
+        let mut cols = MIN_DISPLAY_COLS;
+        let mut x = self.origin.x + HEADER_COL_WIDTH;
+        for col in 0..MAX_COLS.min(256) {
+            x += sheet.col_width(col);
+            if x >= point.x {
+                cols = (col + 1).max(MIN_DISPLAY_COLS);
+                break;
+            }
+            cols = (col + 1).max(MIN_DISPLAY_COLS);
+        }
+        let mut rows = MIN_DISPLAY_ROWS;
+        let mut y = self.origin.y + TITLE_HEIGHT + HEADER_ROW_HEIGHT;
+        for row in 0..MAX_ROWS.min(512) {
+            y += sheet.row_height(row);
+            if y >= point.y {
+                rows = (row + 1).max(MIN_DISPLAY_ROWS);
+                break;
+            }
+            rows = (row + 1).max(MIN_DISPLAY_ROWS);
+        }
+        (cols, rows)
+    }
+
     pub fn hit_tab(&self, point: Point) -> Option<usize> {
         let bounds = self.bounds();
         let top = bounds.y + bounds.height - TAB_HEIGHT;
@@ -678,6 +882,12 @@ impl Spreadsheet {
                     )));
                 }
             }
+            if sheet.visible_cols > MAX_COLS || sheet.visible_rows > MAX_ROWS {
+                return Err(DocumentError::Invalid(format!(
+                    "sheet {} is larger than an Excel worksheet",
+                    sheet.name
+                )));
+            }
         }
         Ok(())
     }
@@ -705,8 +915,8 @@ impl Spreadsheet {
             bounds.y + 18.0,
             crate::document::escape_xml(&sheet.name)
         ));
-        let cols = sheet.display_cols().min(40);
-        let rows = sheet.display_rows().min(80);
+        let cols = sheet.display_cols().min(256);
+        let rows = sheet.display_rows().min(256);
         for col in 0..cols {
             for row in 0..rows {
                 let addr = CellAddr { col, row };

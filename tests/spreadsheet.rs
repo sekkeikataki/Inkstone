@@ -319,6 +319,131 @@ fn column_names_and_hit_testing_cover_the_visible_grid() {
 }
 
 #[test]
+fn new_workbook_spawns_a_ten_by_ten_grid_you_can_extend() {
+    let mut book = Spreadsheet::new();
+    assert_eq!(book.active().display_cols(), 10);
+    assert_eq!(book.active().display_rows(), 10);
+    book.active_mut()
+        .grow_to_include(CellAddr { col: 14, row: 11 });
+    assert_eq!(book.active().display_cols(), 15);
+    assert_eq!(book.active().display_rows(), 12);
+    book.active_mut().add_visible_cols(5);
+    book.active_mut().add_visible_rows(5);
+    assert_eq!(book.active().display_cols(), 20);
+    assert_eq!(book.active().display_rows(), 17);
+    let handle = book.grow_handle_rect();
+    assert!(book.hit_grow_handle(Point::new(handle.x + 1.0, handle.y + 1.0)));
+}
+
+#[test]
+fn worksheet_functions_cover_lookups_finance_and_text() {
+    assert_eq!(
+        num(
+            &[
+                ("A1", "10"),
+                ("A2", "20"),
+                ("B1", "east"),
+                ("B2", "west"),
+                ("C1", "=SUMIFS(A1:A2,B1:B2,\"east\")"),
+                ("C2", "=COUNTIFS(B1:B2,\"west\")"),
+                ("C3", "=SUMPRODUCT(A1:A2,A1:A2)"),
+                ("C4", "=IFS(A1>15,\"big\",A1>0,\"ok\")"),
+                ("C5", "=TEXTJOIN(\"-\",TRUE,B1,B2)"),
+                ("C6", "=PROPER(\"motor winding\")"),
+                ("C7", "=PMT(0.01,12,-1000)"),
+                ("C8", "=EVEN(3)"),
+                ("C9", "=ODD(2)"),
+                ("C10", "=GCD(24,18)"),
+                ("C11", "=SWITCH(A1,10,\"ten\",20,\"twenty\")"),
+                ("C12", "=TIME(6,30,0)*24"),
+            ],
+            "C1"
+        ),
+        10.0
+    );
+    assert_eq!(
+        num(
+            &[
+                ("A1", "10"),
+                ("A2", "20"),
+                ("B1", "east"),
+                ("B2", "west"),
+                ("C2", "=COUNTIFS(B1:B2,\"west\")")
+            ],
+            "C2"
+        ),
+        1.0
+    );
+    assert_eq!(
+        num(
+            &[
+                ("A1", "10"),
+                ("A2", "20"),
+                ("C3", "=SUMPRODUCT(A1:A2,A1:A2)")
+            ],
+            "C3"
+        ),
+        500.0
+    );
+    assert_eq!(
+        eval(
+            &[("A1", "10"), ("C4", "=IFS(A1>15,\"big\",A1>0,\"ok\")")],
+            "C4"
+        ),
+        Value::Text("ok".into())
+    );
+    assert_eq!(
+        eval(
+            &[
+                ("B1", "east"),
+                ("B2", "west"),
+                ("C5", "=TEXTJOIN(\"-\",TRUE,B1,B2)")
+            ],
+            "C5"
+        ),
+        Value::Text("east-west".into())
+    );
+    assert_eq!(
+        eval(&[("C6", "=PROPER(\"motor winding\")")], "C6"),
+        Value::Text("Motor Winding".into())
+    );
+    let pmt = num(&[("C7", "=PMT(0.01,12,-1000)")], "C7");
+    assert!((pmt - 88.8488).abs() < 0.01);
+    assert_eq!(num(&[("C8", "=EVEN(3)")], "C8"), 4.0);
+    assert_eq!(num(&[("C9", "=ODD(2)")], "C9"), 3.0);
+    assert_eq!(num(&[("C10", "=GCD(24,18)")], "C10"), 6.0);
+    assert_eq!(
+        eval(
+            &[
+                ("A1", "10"),
+                ("C11", "=SWITCH(A1,10,\"ten\",20,\"twenty\")")
+            ],
+            "C11"
+        ),
+        Value::Text("ten".into())
+    );
+    assert!((num(&[("C12", "=TIME(6,30,0)*24")], "C12") - 6.5).abs() < 1e-9);
+}
+
+#[test]
+fn copy_fill_and_paste_rewrite_formulas() {
+    let mut sheet = Sheet::named("Sheet1");
+    sheet.set_input(CellAddr::parse_a1("A1").unwrap(), "1".into());
+    sheet.set_input(CellAddr::parse_a1("B1").unwrap(), "=A1+1".into());
+    let copied = sheet.copy_range(CellRange::parse("A1:B1").unwrap(), 0, 0);
+    sheet.paste_from(
+        CellAddr::parse_a1("A1").unwrap(),
+        &copied,
+        CellAddr::parse_a1("A3").unwrap(),
+    );
+    assert_eq!(sheet.cells[&CellAddr::parse_a1("A3").unwrap()].input, "1");
+    assert_eq!(
+        sheet.cells[&CellAddr::parse_a1("B3").unwrap()].input,
+        "=A3+1"
+    );
+}
+
+#[test]
 fn parse_literal_distinguishes_numbers_and_text() {
     assert_eq!(parse_literal("42"), Value::Number(42.0));
     assert_eq!(parse_literal("10%"), Value::Number(0.1));

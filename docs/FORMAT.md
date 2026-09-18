@@ -43,8 +43,9 @@ the field keep loading.
 
 - `notes` (default): the original drawing layer. It stores `elements` (strokes, text, shapes,
   connectors, media).
-- `excel`: a spreadsheet workbook that lives on the canvas. `elements` is empty; the workbook is in
-  `spreadsheet`. Cells are sparse A1 keys (`"B12"`) with the typed input (`10`, `Revenue`,
+- `excel`: a spreadsheet workbook that lives on the canvas. New sheets open as a 10×10 grid
+  (`visible_cols` / `visible_rows`) that grows when you type past the edge, drag the resize handle,
+  or use +Col/+Row. `elements` is empty; the workbook is in `spreadsheet`. Cells are sparse A1 keys (`"B12"`) with the typed input (`10`, `Revenue`,
   `=SUM(A1:A3)`) and optional style. Formulas use Excel A1 references, `$` anchors, sheet names
   (`Costs!A1`, `'My Sheet'!B2`), ranges, and a large Excel-compatible function set (`SUM`, `IF`,
   `VLOOKUP`, `INDEX`, `MATCH`, `COUNTIF`, date serials, and so on). Computed values are recalculated
