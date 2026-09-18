@@ -66,26 +66,24 @@ fn native_media_notebook_and_pdf_flow() {
     assert!(svg.contains("data-kind=\"spreadsheet\""));
     assert!(svg.contains("20"));
     assert!(std::fs::metadata(sheet_pdf).unwrap().len() > 100);
-}
 
-#[test]
-#[ignore = "requires a graphical display; run under xvfb-run"]
-fn pdf_pages_import_as_annotatable_canvas_backgrounds() {
-    gtk4::init().expect("GTK must initialize");
-    let directory = tempdir().unwrap();
-    let pdf_path = directory.path().join("page.pdf");
+    canvas.goto_sheet_address("B2");
+    canvas.freeze_sheet_panes();
+    assert_eq!(canvas.frozen_panes(), (1, 1));
+
+    let source_pdf = directory.path().join("page.pdf");
     std::fs::write(
-        &pdf_path,
+        &source_pdf,
         b"%PDF-1.1\n1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\n3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \ntrailer<< /Root 1 0 R /Size 4 >>\nstartxref\n190\n%%EOF\n",
     )
     .unwrap();
-
-    let canvas = Canvas::new();
-    canvas.import_media(&pdf_path).unwrap();
-    let notebook_path = directory.path().join("annotated.inkstone");
-    canvas.save(&notebook_path).unwrap();
-    let loaded = Notebook::load(&notebook_path).unwrap();
-    let background = &loaded.pages[0].layers[0];
+    canvas.add_page();
+    canvas.import_media(&source_pdf).unwrap();
+    let annotated = directory.path().join("annotated.inkstone");
+    canvas.save(&annotated).unwrap();
+    let loaded = Notebook::load(&annotated).unwrap();
+    let page = loaded.pages.last().unwrap();
+    let background = &page.layers[0];
     assert!(background.locked);
     assert_eq!(background.elements.len(), 1);
     match &background.elements[0] {
@@ -94,5 +92,5 @@ fn pdf_pages_import_as_annotatable_canvas_backgrounds() {
         }
         other => panic!("expected rasterized PDF image, got {other:?}"),
     }
-    assert!(loaded.pages[0].layers.iter().any(|layer| !layer.locked));
+    assert!(page.layers.iter().any(|layer| !layer.locked));
 }
