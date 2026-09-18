@@ -24,8 +24,10 @@ cd android
 ./gradlew assembleDebug
 ```
 
-The debug APK is `android/app/build/outputs/apk/debug/app-debug.apk`. Sideload it, then open
-[`examples/phone-demo.inkstone`](../examples/phone-demo.inkstone) from the device.
+A sideloadable debug APK is checked in at
+[`releases/inkstone-android.apk`](../releases/inkstone-android.apk). Download that file onto the
+phone, enable install from this source, and open [`examples/phone-demo.inkstone`](../examples/phone-demo.inkstone).
+Rebuilding locally still writes `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Release signing is left to your keystore:
 
