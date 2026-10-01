@@ -192,7 +192,6 @@ fn install_css() {
             box-shadow: 0 4px 18px alpha(#000, 0.16);
             border: 1px solid alpha(@window_fg_color, 0.12);
         }
-        }
         .tool-button {
             border-radius: 999px;
             min-width: 36px;
@@ -289,7 +288,7 @@ fn install_css() {
         }
         .section-dot {
             border-radius: 999px;
-            margin-end: 6px;
+            margin-right: 6px;
         }
         .section-tab {
             padding: 4px 10px;
@@ -325,7 +324,7 @@ fn install_css() {
             margin: 6px;
         }
         .restore-island image {
-            margin-end: 4px;
+            margin-right: 4px;
         }
         .island-drag {
             padding: 2px 4px;
@@ -333,7 +332,6 @@ fn install_css() {
         }
         .island-drag:hover {
             color: @window_fg_color;
-        }
         }
         .swatch-ink { background-color: #1a1f29; }
         .swatch-white { background-color: #f7f7f4; border-color: alpha(@borders, 0.9); }
