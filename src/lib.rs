@@ -2,6 +2,7 @@
 pub mod app;
 #[cfg(feature = "desktop")]
 pub mod canvas;
+pub mod cli;
 pub mod document;
 pub mod library;
 pub mod local;
