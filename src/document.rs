@@ -7,6 +7,19 @@ use uuid::Uuid;
 
 pub const FORMAT_NAME: &str = "inkstone.document";
 pub const FORMAT_VERSION: u32 = 1;
+/// PostScript points per millimetre (72 pt/in, ISO 216).
+pub const PT_PER_MM: f32 = 72.0 / 25.4;
+pub const MIN_STROKE_WIDTH: f32 = 0.13 * PT_PER_MM;
+pub const MAX_STROKE_WIDTH: f32 = 70.0 * PT_PER_MM;
+pub const ISO_LINE_WIDTHS_MM: [f32; 6] = [0.25, 0.35, 0.5, 0.7, 1.0, 1.4];
+
+pub fn mm_to_pt(mm: f32) -> f32 {
+    mm * PT_PER_MM
+}
+
+pub fn pt_to_mm(pt: f32) -> f32 {
+    pt / PT_PER_MM
+}
 
 #[derive(Debug, Error)]
 pub enum DocumentError {
@@ -48,15 +61,22 @@ impl Point {
         )
     }
 
+    pub fn scale_from(self, origin: Self, scale_x: f32, scale_y: f32) -> Self {
+        self.scale_about(origin, scale_x, scale_y)
+    }
+
     pub fn rotate_about(self, center: Self, degrees: f32) -> Self {
-        let radians = degrees.to_radians();
-        let (sin, cos) = radians.sin_cos();
+        let (sin, cos) = degrees.to_radians().sin_cos();
         let dx = self.x - center.x;
         let dy = self.y - center.y;
         Self::new(
             center.x + dx * cos - dy * sin,
             center.y + dx * sin + dy * cos,
         )
+    }
+
+    pub fn rotate_around(self, center: Self, degrees: f32) -> Self {
+        self.rotate_about(center, degrees)
     }
 }
 
@@ -79,33 +99,39 @@ impl Rect {
     }
 
     pub fn expand(self, amount: f32) -> Self {
+        let rect = self.normalized();
         Self {
-            x: self.x - amount,
-            y: self.y - amount,
-            width: self.width + amount * 2.0,
-            height: self.height + amount * 2.0,
+            x: rect.x - amount,
+            y: rect.y - amount,
+            width: rect.width + amount * 2.0,
+            height: rect.height + amount * 2.0,
         }
     }
 
     pub fn contains(self, point: Point) -> bool {
-        point.x >= self.x
-            && point.x <= self.x + self.width
-            && point.y >= self.y
-            && point.y <= self.y + self.height
+        let rect = self.normalized();
+        point.x >= rect.x
+            && point.x <= rect.x + rect.width
+            && point.y >= rect.y
+            && point.y <= rect.y + rect.height
     }
 
     pub fn intersects(self, other: Self) -> bool {
-        self.x <= other.x + other.width
-            && self.x + self.width >= other.x
-            && self.y <= other.y + other.height
-            && self.y + self.height >= other.y
+        let a = self.normalized();
+        let b = other.normalized();
+        a.x <= b.x + b.width
+            && a.x + a.width >= b.x
+            && a.y <= b.y + b.height
+            && a.y + a.height >= b.y
     }
 
     pub fn union(self, other: Self) -> Self {
-        let x = self.x.min(other.x);
-        let y = self.y.min(other.y);
-        let right = (self.x + self.width).max(other.x + other.width);
-        let bottom = (self.y + self.height).max(other.y + other.height);
+        let a = self.normalized();
+        let b = other.normalized();
+        let x = a.x.min(b.x);
+        let y = a.y.min(b.y);
+        let right = (a.x + a.width).max(b.x + b.width);
+        let bottom = (a.y + a.height).max(b.y + b.height);
         Self {
             x,
             y,
@@ -115,7 +141,8 @@ impl Rect {
     }
 
     pub fn center(self) -> Point {
-        Point::new(self.x + self.width / 2.0, self.y + self.height / 2.0)
+        let rect = self.normalized();
+        Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
     }
 
     pub fn is_finite(self) -> bool {
@@ -123,8 +150,42 @@ impl Rect {
             && self.y.is_finite()
             && self.width.is_finite()
             && self.height.is_finite()
-            && self.width >= 0.0
-            && self.height >= 0.0
+    }
+
+    pub fn from_drag(start: Point, end: Point) -> Self {
+        Self {
+            x: start.x,
+            y: start.y,
+            width: end.x - start.x,
+            height: end.y - start.y,
+        }
+    }
+
+    pub fn start(self) -> Point {
+        Point::new(self.x, self.y)
+    }
+
+    pub fn end(self) -> Point {
+        Point::new(self.x + self.width, self.y + self.height)
+    }
+
+    pub fn normalized(self) -> Self {
+        let (x, width) = if self.width < 0.0 {
+            (self.x + self.width, -self.width)
+        } else {
+            (self.x, self.width)
+        };
+        let (y, height) = if self.height < 0.0 {
+            (self.y + self.height, -self.height)
+        } else {
+            (self.y, self.height)
+        };
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn scale_about(self, pivot: Point, sx: f32, sy: f32) -> Self {
@@ -155,6 +216,8 @@ impl Color {
     pub const INK: Self = Self::rgb(0.10, 0.12, 0.16);
     pub const BLUE: Self = Self::rgb(0.12, 0.38, 0.88);
     pub const PAPER: Self = Self::rgb(0.98, 0.98, 0.97);
+    pub const NIGHT: Self = Self::rgb(0.10, 0.12, 0.16);
+    pub const NIGHT_INK: Self = Self::rgb(0.92, 0.93, 0.90);
 
     pub const fn rgb(red: f32, green: f32, blue: f32) -> Self {
         Self {
@@ -180,6 +243,74 @@ impl Color {
             self.alpha
         )
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if let Some(hex) = value.strip_prefix('#') {
+            let (red, green, blue, alpha) = match hex.len() {
+                3 => (
+                    u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?,
+                    u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?,
+                    u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?,
+                    255u8,
+                ),
+                6 => (
+                    u8::from_str_radix(&hex[0..2], 16).ok()?,
+                    u8::from_str_radix(&hex[2..4], 16).ok()?,
+                    u8::from_str_radix(&hex[4..6], 16).ok()?,
+                    255u8,
+                ),
+                8 => (
+                    u8::from_str_radix(&hex[0..2], 16).ok()?,
+                    u8::from_str_radix(&hex[2..4], 16).ok()?,
+                    u8::from_str_radix(&hex[4..6], 16).ok()?,
+                    u8::from_str_radix(&hex[6..8], 16).ok()?,
+                ),
+                _ => return None,
+            };
+            return Some(Self {
+                red: red as f32 / 255.0,
+                green: green as f32 / 255.0,
+                blue: blue as f32 / 255.0,
+                alpha: alpha as f32 / 255.0,
+            });
+        }
+        let lower = value.to_ascii_lowercase();
+        let (channels, body) = if let Some(body) = lower
+            .strip_prefix("rgba(")
+            .and_then(|body| body.strip_suffix(')'))
+        {
+            (4, body)
+        } else {
+            let body = lower
+                .strip_prefix("rgb(")
+                .and_then(|body| body.strip_suffix(')'))?;
+            (3, body)
+        };
+        let mut parts = body.split(',').map(str::trim);
+        let red = parse_css_channel(parts.next()?)?;
+        let green = parse_css_channel(parts.next()?)?;
+        let blue = parse_css_channel(parts.next()?)?;
+        let alpha = if channels == 4 {
+            parts.next()?.parse::<f32>().ok()?.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        Some(Self {
+            red,
+            green,
+            blue,
+            alpha,
+        })
+    }
+}
+
+fn parse_css_channel(value: &str) -> Option<f32> {
+    if let Some(percent) = value.strip_suffix('%') {
+        Some((percent.parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0))
+    } else {
+        Some((value.parse::<f32>().ok()? / 255.0).clamp(0.0, 1.0))
+    }
 }
 
 impl Default for Color {
@@ -188,19 +319,150 @@ impl Default for Color {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundPattern {
+    None,
+    #[default]
+    Grid,
+    Dots,
+    Lines,
+}
+
+impl BackgroundPattern {
+    pub const ALL: [Self; 4] = [Self::None, Self::Grid, Self::Dots, Self::Lines];
+    pub const NAMES: [&'static str; 4] = ["Plain", "Grid", "Dots", "Lined"];
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageLayout {
+    #[default]
+    Infinite,
+    Fixed,
+    ContinuousVertical,
+}
+
+impl PageLayout {
+    pub const ALL: [Self; 3] = [Self::Infinite, Self::Fixed, Self::ContinuousVertical];
+    pub const NAMES: [&'static str; 3] = ["Infinite", "Sheet", "Vertical"];
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperSize {
+    Infinite,
+    A5,
+    #[default]
+    A4,
+    A3,
+    A2,
+}
+
+impl PaperSize {
+    pub const ALL: [Self; 5] = [Self::Infinite, Self::A5, Self::A4, Self::A3, Self::A2];
+    pub const NAMES: [&'static str; 5] = [
+        "Infinite",
+        "A5 · 148×210 mm",
+        "A4 · 210×297 mm",
+        "A3 · 297×420 mm",
+        "A2 · 420×594 mm",
+    ];
+
+    pub fn dimensions_mm(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Infinite => None,
+            Self::A5 => Some((148.0, 210.0)),
+            Self::A4 => Some((210.0, 297.0)),
+            Self::A3 => Some((297.0, 420.0)),
+            Self::A2 => Some((420.0, 594.0)),
+        }
+    }
+
+    pub fn dimensions_pt(self) -> Option<(f32, f32)> {
+        self.dimensions_mm()
+            .map(|(width, height)| (mm_to_pt(width), mm_to_pt(height)))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CanvasSettings {
     pub background: Color,
     pub grid_spacing: f32,
     pub grid_visible: bool,
+    #[serde(default)]
+    pub pattern: Option<BackgroundPattern>,
+    #[serde(default)]
+    pub layout: PageLayout,
+    #[serde(default = "default_page_width")]
+    pub page_width: f32,
+    #[serde(default = "default_page_height")]
+    pub page_height: f32,
+}
+
+fn default_page_width() -> f32 {
+    mm_to_pt(210.0)
+}
+
+fn default_page_height() -> f32 {
+    mm_to_pt(297.0)
 }
 
 impl Default for CanvasSettings {
     fn default() -> Self {
         Self {
             background: Color::PAPER,
-            grid_spacing: 24.0,
+            grid_spacing: mm_to_pt(5.0),
             grid_visible: true,
+            pattern: Some(BackgroundPattern::Grid),
+            layout: PageLayout::Infinite,
+            page_width: default_page_width(),
+            page_height: default_page_height(),
+        }
+    }
+}
+
+impl CanvasSettings {
+    pub fn pattern(&self) -> BackgroundPattern {
+        self.pattern.unwrap_or(if self.grid_visible {
+            BackgroundPattern::Grid
+        } else {
+            BackgroundPattern::None
+        })
+    }
+
+    pub fn set_pattern(&mut self, pattern: BackgroundPattern) {
+        self.pattern = Some(pattern);
+        self.grid_visible = matches!(pattern, BackgroundPattern::Grid);
+    }
+
+    pub fn paper_size(&self) -> PaperSize {
+        if self.layout == PageLayout::Infinite {
+            return PaperSize::Infinite;
+        }
+        let width = pt_to_mm(self.page_width);
+        let height = pt_to_mm(self.page_height);
+        for size in [PaperSize::A5, PaperSize::A4, PaperSize::A3, PaperSize::A2] {
+            if let Some((mm_w, mm_h)) = size.dimensions_mm()
+                && (width - mm_w).abs() < 2.0
+                && (height - mm_h).abs() < 2.0
+            {
+                return size;
+            }
+        }
+        PaperSize::A4
+    }
+
+    pub fn set_paper_size(&mut self, size: PaperSize) {
+        match size.dimensions_pt() {
+            None => self.layout = PageLayout::Infinite,
+            Some((width, height)) => {
+                if self.layout == PageLayout::Infinite {
+                    self.layout = PageLayout::Fixed;
+                }
+                self.page_width = width;
+                self.page_height = height;
+            }
         }
     }
 }
@@ -209,13 +471,16 @@ impl Default for CanvasSettings {
 pub struct StrokeStyle {
     pub color: Color,
     pub width: f32,
+    #[serde(default)]
+    pub dashed: bool,
 }
 
 impl Default for StrokeStyle {
     fn default() -> Self {
         Self {
             color: Color::INK,
-            width: 2.4,
+            width: mm_to_pt(0.5),
+            dashed: false,
         }
     }
 }
@@ -225,6 +490,7 @@ impl Default for StrokeStyle {
 pub enum StrokeKind {
     Pen,
     Highlighter,
+    Brush,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -395,42 +661,145 @@ fn segment_circle_hits(a: Point, b: Point, center: Point, radius: f32) -> Vec<f3
 pub enum ShapeKind {
     Rectangle,
     Ellipse,
+    Line,
+    Arrow,
+    Triangle,
     Resistor,
     Capacitor,
+    Diode,
+    Inductor,
+    Switch,
+    Fuse,
+    Battery,
     Ground,
+    Lamp,
+    Transformer,
+    AndGate,
+    OrGate,
+    NotGate,
+    NandGate,
+    NorGate,
+    XorGate,
     Motor,
     Gear,
     Bearing,
     Spring,
     Beam,
+    Dimension,
+    SurfaceFinish,
+    ThirdAngle,
 }
 
 impl ShapeKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 29] = [
         Self::Rectangle,
         Self::Ellipse,
+        Self::Line,
+        Self::Arrow,
+        Self::Triangle,
         Self::Resistor,
         Self::Capacitor,
+        Self::Diode,
+        Self::Inductor,
+        Self::Switch,
+        Self::Fuse,
+        Self::Battery,
         Self::Ground,
+        Self::Lamp,
+        Self::Transformer,
+        Self::AndGate,
+        Self::OrGate,
+        Self::NotGate,
+        Self::NandGate,
+        Self::NorGate,
+        Self::XorGate,
         Self::Motor,
         Self::Gear,
         Self::Bearing,
         Self::Spring,
         Self::Beam,
+        Self::Dimension,
+        Self::SurfaceFinish,
+        Self::ThirdAngle,
     ];
 
-    pub const NAMES: [&'static str; 10] = [
+    pub const NAMES: [&'static str; 29] = [
         "Rectangle",
         "Ellipse",
-        "Resistor",
+        "Line",
+        "Arrow",
+        "Triangle",
+        "Resistor IEC",
         "Capacitor",
-        "Ground",
+        "Diode",
+        "Inductor",
+        "Switch",
+        "Fuse",
+        "Battery",
+        "Earth",
+        "Lamp",
+        "Transformer",
+        "AND",
+        "OR",
+        "NOT",
+        "NAND",
+        "NOR",
+        "XOR",
         "Motor",
         "Gear",
         "Bearing",
         "Spring",
         "Beam",
+        "Dimension",
+        "Surface finish",
+        "Third-angle",
     ];
+
+    pub const SHORT: [&'static str; 29] = [
+        "Rect", "Ellipse", "Line", "Arrow", "Tri", "R", "C", "D", "L", "S", "Fuse", "Batt", "PE",
+        "Lamp", "Tr", "AND", "OR", "NOT", "NAND", "NOR", "XOR", "M", "Gear", "Brg", "Spring",
+        "Beam", "Dim", "Ra", "3rd",
+    ];
+
+    pub fn group(self) -> &'static str {
+        match self {
+            Self::Rectangle | Self::Ellipse | Self::Line | Self::Arrow | Self::Triangle => {
+                "Geometry"
+            }
+            Self::Resistor
+            | Self::Capacitor
+            | Self::Diode
+            | Self::Inductor
+            | Self::Switch
+            | Self::Fuse
+            | Self::Battery
+            | Self::Ground
+            | Self::Lamp
+            | Self::Transformer => "IEC 60617",
+            Self::AndGate
+            | Self::OrGate
+            | Self::NotGate
+            | Self::NandGate
+            | Self::NorGate
+            | Self::XorGate => "Logic",
+            Self::Motor
+            | Self::Gear
+            | Self::Bearing
+            | Self::Spring
+            | Self::Beam
+            | Self::Dimension
+            | Self::SurfaceFinish
+            | Self::ThirdAngle => "ISO 128/129",
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        Self::SHORT[Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0)]
+    }
+
+    pub fn uses_drag_bounds(self) -> bool {
+        matches!(self, Self::Line | Self::Arrow | Self::Dimension)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -478,6 +847,21 @@ pub struct Connector {
     pub label: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListStyle {
+    #[default]
+    None,
+    Bullet,
+    Numbered,
+    Checklist,
+}
+
+impl ListStyle {
+    pub const ALL: [Self; 4] = [Self::None, Self::Bullet, Self::Numbered, Self::Checklist];
+    pub const NAMES: [&'static str; 4] = ["Plain", "Bullets", "Numbered", "To-do"];
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TextNote {
     pub id: Uuid,
@@ -486,6 +870,183 @@ pub struct TextNote {
     pub font_size: f32,
     pub color: Color,
     pub max_width: Option<f32>,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub highlight: Option<Color>,
+    #[serde(default)]
+    pub list: ListStyle,
+    #[serde(default)]
+    pub href: Option<String>,
+    #[serde(default)]
+    pub checked: bool,
+}
+
+impl TextNote {
+    pub fn plain(origin: Point, text: impl Into<String>, font_size: f32, color: Color) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            origin,
+            text: text.into(),
+            font_size,
+            color,
+            max_width: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            highlight: None,
+            list: ListStyle::None,
+            href: None,
+            checked: false,
+        }
+    }
+
+    pub fn prefix(&self) -> &'static str {
+        match self.list {
+            ListStyle::None => "",
+            ListStyle::Bullet => "• ",
+            ListStyle::Numbered => "1. ",
+            ListStyle::Checklist => {
+                if self.checked {
+                    "☑ "
+                } else {
+                    "☐ "
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagKind {
+    ToDo,
+    Important,
+    Question,
+    Idea,
+    Critical,
+    Definition,
+    Contact,
+    Address,
+    Phone,
+    Date,
+}
+
+impl TagKind {
+    pub const ALL: [Self; 10] = [
+        Self::ToDo,
+        Self::Important,
+        Self::Question,
+        Self::Idea,
+        Self::Critical,
+        Self::Definition,
+        Self::Contact,
+        Self::Address,
+        Self::Phone,
+        Self::Date,
+    ];
+    pub const NAMES: [&'static str; 10] = [
+        "To-do",
+        "Important",
+        "Question",
+        "Idea",
+        "Critical",
+        "Definition",
+        "Contact",
+        "Address",
+        "Phone",
+        "Date",
+    ];
+
+    pub fn label(self) -> &'static str {
+        Self::NAMES[Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0)]
+    }
+
+    pub fn color(self) -> Color {
+        match self {
+            Self::ToDo => Color::BLUE,
+            Self::Important | Self::Critical => Color::rgb(0.84, 0.16, 0.20),
+            Self::Question => Color::rgb(0.48, 0.20, 0.78),
+            Self::Idea => Color::rgb(0.95, 0.62, 0.05),
+            Self::Definition => Color::rgb(0.05, 0.56, 0.32),
+            Self::Contact => Color::rgb(0.12, 0.38, 0.88),
+            Self::Address => Color::rgb(0.05, 0.60, 0.66),
+            Self::Phone => Color::rgb(0.05, 0.56, 0.32),
+            Self::Date => Color::rgb(0.54, 0.35, 0.20),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TagElement {
+    pub id: Uuid,
+    pub origin: Point,
+    pub kind: TagKind,
+    pub note: String,
+    pub checked: bool,
+}
+
+impl TagElement {
+    pub fn size(&self) -> (f32, f32) {
+        let width = (self.note.chars().count() as f32 * 8.2 + 54.0).max(108.0);
+        (width, 28.0)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TableElement {
+    pub id: Uuid,
+    pub bounds: Rect,
+    pub columns: u32,
+    pub rows: u32,
+    pub cells: Vec<String>,
+}
+
+impl TableElement {
+    pub fn new(origin: Point, columns: u32, rows: u32) -> Self {
+        let columns = columns.max(1);
+        let rows = rows.max(1);
+        Self {
+            id: Uuid::new_v4(),
+            bounds: Rect {
+                x: origin.x,
+                y: origin.y,
+                width: 96.0 * columns as f32,
+                height: 32.0 * rows as f32,
+            },
+            columns,
+            rows,
+            cells: vec![String::new(); (columns * rows) as usize],
+        }
+    }
+
+    pub fn cell_size(&self) -> (f32, f32) {
+        (
+            self.bounds.width / self.columns.max(1) as f32,
+            self.bounds.height / self.rows.max(1) as f32,
+        )
+    }
+
+    pub fn cell_index(&self, point: Point) -> Option<usize> {
+        let bounds = self.bounds.normalized();
+        if !bounds.contains(point) || self.columns == 0 || self.rows == 0 {
+            return None;
+        }
+        let (cell_w, cell_h) = self.cell_size();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let column = ((point.x - bounds.x) / cell_w).floor() as u32;
+        let row = ((point.y - bounds.y) / cell_h).floor() as u32;
+        if column >= self.columns || row >= self.rows {
+            return None;
+        }
+        Some((row * self.columns + column) as usize)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -493,6 +1054,8 @@ pub struct TextNote {
 pub enum MediaKind {
     Image,
     Pdf,
+    File,
+    Audio,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -513,6 +1076,8 @@ pub enum Element {
     Shape(Shape),
     Connector(Connector),
     Media(MediaElement),
+    Table(TableElement),
+    Tag(TagElement),
 }
 
 impl Element {
@@ -523,6 +1088,8 @@ impl Element {
             Self::Shape(value) => value.id,
             Self::Connector(value) => value.id,
             Self::Media(value) => value.id,
+            Self::Table(value) => value.id,
+            Self::Tag(value) => value.id,
         }
     }
 
@@ -533,6 +1100,8 @@ impl Element {
             Self::Shape(value) => value.id = id,
             Self::Connector(value) => value.id = id,
             Self::Media(value) => value.id = id,
+            Self::Table(value) => value.id = id,
+            Self::Tag(value) => value.id = id,
         }
     }
 
@@ -560,12 +1129,14 @@ impl Element {
                 bounds.expand(stroke.style.width)
             }
             Self::Text(text) => {
+                let prefix = text.prefix().chars().count() as f32;
                 let longest = text
                     .text
                     .lines()
                     .map(|line| line.chars().count())
                     .max()
-                    .unwrap_or(1) as f32;
+                    .unwrap_or(1) as f32
+                    + prefix;
                 let lines = text.text.lines().count().max(1) as f32;
                 Rect {
                     x: text.origin.x,
@@ -576,7 +1147,7 @@ impl Element {
                     height: lines * text.font_size * 1.25,
                 }
             }
-            Self::Shape(shape) => shape.bounds.expand(shape.style.width + 4.0),
+            Self::Shape(shape) => shape.bounds.normalized().expand(shape.style.width + 4.0),
             Self::Connector(connector) => {
                 let mut bounds = Rect::from_points(connector.start.point, connector.end.point);
                 for point in &connector.route {
@@ -590,6 +1161,16 @@ impl Element {
                 bounds.expand(connector.style.width + 4.0)
             }
             Self::Media(media) => media.bounds,
+            Self::Table(table) => table.bounds,
+            Self::Tag(tag) => {
+                let (width, height) = tag.size();
+                Rect {
+                    x: tag.origin.x,
+                    y: tag.origin.y,
+                    width,
+                    height,
+                }
+            }
         }
     }
 
@@ -610,8 +1191,9 @@ impl Element {
                 (Anchor::End, connector.end.point),
             ],
             Self::Shape(shape) => cardinal_anchors(shape.bounds),
-            Self::Text(_) => cardinal_anchors(self.bounds()),
+            Self::Text(_) | Self::Tag(_) => cardinal_anchors(self.bounds()),
             Self::Media(media) => cardinal_anchors(media.bounds),
+            Self::Table(table) => cardinal_anchors(table.bounds),
         }
     }
 
@@ -645,99 +1227,167 @@ impl Element {
                 media.bounds.x += delta.x;
                 media.bounds.y += delta.y;
             }
+            Self::Table(table) => {
+                table.bounds.x += delta.x;
+                table.bounds.y += delta.y;
+            }
+            Self::Tag(tag) => {
+                tag.origin.x += delta.x;
+                tag.origin.y += delta.y;
+            }
         }
     }
 
     pub fn scale_about(&mut self, pivot: Point, sx: f32, sy: f32) {
-        let sx = if sx.is_finite() { sx } else { 1.0 };
-        let sy = if sy.is_finite() { sy } else { 1.0 };
-        match self {
-            Self::Stroke(stroke) => {
-                for point in &mut stroke.points {
-                    let scaled = point.point().scale_about(pivot, sx, sy);
-                    point.x = scaled.x;
-                    point.y = scaled.y;
-                }
-                stroke.style.width = (stroke.style.width * sx.abs().max(sy.abs())).max(0.4);
-            }
-            Self::Text(text) => {
-                text.origin = text.origin.scale_about(pivot, sx, sy);
-                text.font_size = (text.font_size * sy.abs().max(0.15)).max(6.0);
-                if let Some(width) = text.max_width.as_mut() {
-                    *width = (*width * sx.abs()).max(12.0);
-                }
-            }
-            Self::Shape(shape) => {
-                let scaled = shape.bounds.scale_about(pivot, sx, sy);
-                if scaled.width >= 8.0 && scaled.height >= 8.0 {
-                    shape.bounds = scaled;
-                }
-            }
-            Self::Connector(connector) => {
-                connector.start.point = connector.start.point.scale_about(pivot, sx, sy);
-                connector.end.point = connector.end.point.scale_about(pivot, sx, sy);
-                for point in &mut connector.route {
-                    *point = point.scale_about(pivot, sx, sy);
-                }
-            }
-            Self::Media(media) => {
-                let scaled = media.bounds.scale_about(pivot, sx, sy);
-                if scaled.width >= 8.0 && scaled.height >= 8.0 {
-                    media.bounds = scaled;
-                }
-            }
-        }
+        self.scale_from(pivot, sx, sy);
     }
 
     pub fn rotate_about(&mut self, center: Point, degrees: f32) {
-        if !degrees.is_finite() || degrees.abs() < 0.01 {
+        self.rotate_around(center, degrees);
+    }
+
+    pub fn rotate_around(&mut self, center: Point, degrees: f32) {
+        if degrees.abs() < f32::EPSILON {
             return;
         }
         match self {
             Self::Stroke(stroke) => {
                 for point in &mut stroke.points {
-                    let rotated = point.point().rotate_about(center, degrees);
+                    let rotated = point.point().rotate_around(center, degrees);
                     point.x = rotated.x;
                     point.y = rotated.y;
                 }
             }
             Self::Text(text) => {
-                text.origin = text.origin.rotate_about(center, degrees);
+                text.origin = text.origin.rotate_around(center, degrees);
             }
             Self::Shape(shape) => {
-                let rotated = shape.bounds.center().rotate_about(center, degrees);
+                let rotated = shape.bounds.center().rotate_around(center, degrees);
                 shape.bounds.x = rotated.x - shape.bounds.width / 2.0;
                 shape.bounds.y = rotated.y - shape.bounds.height / 2.0;
                 shape.rotation_degrees = (shape.rotation_degrees + degrees).rem_euclid(360.0);
             }
             Self::Connector(connector) => {
-                connector.start.point = connector.start.point.rotate_about(center, degrees);
-                connector.end.point = connector.end.point.rotate_about(center, degrees);
+                connector.start.point = connector.start.point.rotate_around(center, degrees);
+                connector.end.point = connector.end.point.rotate_around(center, degrees);
                 for point in &mut connector.route {
-                    *point = point.rotate_about(center, degrees);
+                    *point = point.rotate_around(center, degrees);
                 }
             }
             Self::Media(media) => {
-                let rotated = media.bounds.center().rotate_about(center, degrees);
+                let rotated = media.bounds.center().rotate_around(center, degrees);
                 media.bounds.x = rotated.x - media.bounds.width / 2.0;
                 media.bounds.y = rotated.y - media.bounds.height / 2.0;
+            }
+            Self::Table(table) => {
+                let rotated = table.bounds.center().rotate_around(center, degrees);
+                table.bounds.x = rotated.x - table.bounds.width / 2.0;
+                table.bounds.y = rotated.y - table.bounds.height / 2.0;
+            }
+            Self::Tag(tag) => {
+                tag.origin = tag.origin.rotate_around(center, degrees);
             }
         }
     }
 
-    pub fn searchable_text(&self) -> &str {
+    pub fn scale_from(&mut self, origin: Point, scale_x: f32, scale_y: f32) {
+        let scale_x = if scale_x.abs() < 0.05 {
+            0.05_f32.copysign(scale_x)
+        } else {
+            scale_x
+        };
+        let scale_y = if scale_y.abs() < 0.05 {
+            0.05_f32.copysign(scale_y)
+        } else {
+            scale_y
+        };
+        let map = |point: Point| point.scale_from(origin, scale_x, scale_y);
+        let width_scale = ((scale_x.abs() + scale_y.abs()) / 2.0).max(0.05);
         match self {
-            Self::Stroke(_) => "",
-            Self::Text(text) => &text.text,
-            Self::Shape(shape) => &shape.label,
-            Self::Connector(connector) => &connector.label,
-            Self::Media(media) => {
-                if media.caption.is_empty() {
-                    &media.alt_text
-                } else {
-                    &media.caption
+            Self::Stroke(stroke) => {
+                for point in &mut stroke.points {
+                    let scaled = map(point.point());
+                    point.x = scaled.x;
+                    point.y = scaled.y;
+                }
+                stroke.style.width =
+                    (stroke.style.width * width_scale).clamp(MIN_STROKE_WIDTH, MAX_STROKE_WIDTH);
+            }
+            Self::Text(text) => {
+                text.origin = map(text.origin);
+                text.font_size = (text.font_size * scale_y.abs()).max(4.0);
+                if let Some(width) = text.max_width.as_mut() {
+                    *width = (*width * scale_x.abs()).max(8.0);
                 }
             }
+            Self::Shape(shape) => {
+                let start = map(Point::new(shape.bounds.x, shape.bounds.y));
+                let end = map(Point::new(
+                    shape.bounds.x + shape.bounds.width,
+                    shape.bounds.y + shape.bounds.height,
+                ));
+                shape.bounds = Rect::from_points(start, end);
+                shape.style.width =
+                    (shape.style.width * width_scale).clamp(MIN_STROKE_WIDTH, MAX_STROKE_WIDTH);
+            }
+            Self::Connector(connector) => {
+                connector.start.point = map(connector.start.point);
+                connector.end.point = map(connector.end.point);
+                for point in &mut connector.route {
+                    *point = map(*point);
+                }
+                connector.style.width =
+                    (connector.style.width * width_scale).clamp(MIN_STROKE_WIDTH, MAX_STROKE_WIDTH);
+            }
+            Self::Media(media) => {
+                let start = map(Point::new(media.bounds.x, media.bounds.y));
+                let end = map(Point::new(
+                    media.bounds.x + media.bounds.width,
+                    media.bounds.y + media.bounds.height,
+                ));
+                media.bounds = Rect::from_points(start, end);
+                if media.bounds.width < 8.0 {
+                    media.bounds.width = 8.0;
+                }
+                if media.bounds.height < 8.0 {
+                    media.bounds.height = 8.0;
+                }
+            }
+            Self::Table(table) => {
+                let start = map(Point::new(table.bounds.x, table.bounds.y));
+                let end = map(Point::new(
+                    table.bounds.x + table.bounds.width,
+                    table.bounds.y + table.bounds.height,
+                ));
+                table.bounds = Rect::from_points(start, end);
+                if table.bounds.width < 48.0 {
+                    table.bounds.width = 48.0;
+                }
+                if table.bounds.height < 24.0 {
+                    table.bounds.height = 24.0;
+                }
+            }
+            Self::Tag(tag) => {
+                tag.origin = map(tag.origin);
+            }
+        }
+    }
+
+    pub fn searchable_text(&self) -> String {
+        match self {
+            Self::Stroke(_) => String::new(),
+            Self::Text(text) => text.text.clone(),
+            Self::Shape(shape) => shape.label.clone(),
+            Self::Connector(connector) => connector.label.clone(),
+            Self::Media(media) => {
+                if media.caption.is_empty() {
+                    media.alt_text.clone()
+                } else {
+                    media.caption.clone()
+                }
+            }
+            Self::Table(table) => table.cells.join(" "),
+            Self::Tag(tag) => format!("{} {}", tag.kind.label(), tag.note),
         }
     }
 }
@@ -813,6 +1463,10 @@ impl Document {
         if !self.canvas.background.is_valid()
             || !self.canvas.grid_spacing.is_finite()
             || self.canvas.grid_spacing <= 0.0
+            || !self.canvas.page_width.is_finite()
+            || self.canvas.page_width <= 0.0
+            || !self.canvas.page_height.is_finite()
+            || self.canvas.page_height <= 0.0
         {
             return Err(DocumentError::Invalid(
                 "canvas settings contain invalid values".to_owned(),
@@ -849,7 +1503,10 @@ impl Document {
 
     pub(crate) fn validate_element(element: &Element) -> Result<(), DocumentError> {
         let valid_style = |style: &StrokeStyle| {
-            style.color.is_valid() && style.width.is_finite() && style.width > 0.0
+            style.color.is_valid()
+                && style.width.is_finite()
+                && style.width > 0.0
+                && style.width <= MAX_STROKE_WIDTH
         };
         match element {
             Element::Stroke(stroke) => {
@@ -917,6 +1574,28 @@ impl Document {
                     return Err(DocumentError::Invalid(format!(
                         "media {} has invalid geometry",
                         media.id
+                    )));
+                }
+            }
+            Element::Table(table) => {
+                if !table.bounds.is_finite()
+                    || table.bounds.width <= 0.0
+                    || table.bounds.height <= 0.0
+                    || table.columns == 0
+                    || table.rows == 0
+                    || table.cells.len() != (table.columns * table.rows) as usize
+                {
+                    return Err(DocumentError::Invalid(format!(
+                        "table {} has invalid geometry or cells",
+                        table.id
+                    )));
+                }
+            }
+            Element::Tag(tag) => {
+                if !tag.origin.is_finite() || tag.note.trim().is_empty() {
+                    return Err(DocumentError::Invalid(format!(
+                        "tag {} has invalid content",
+                        tag.id
                     )));
                 }
             }
@@ -1004,30 +1683,41 @@ pub(crate) fn element_svg(element: &Element) -> String {
             format!(
                 "<polyline data-inkstone-id=\"{}\" data-kind=\"stroke\" points=\"{}\" \
                  fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" \
-                 stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n",
+                 stroke-linecap=\"round\" stroke-linejoin=\"round\"{}/>\n",
                 stroke.id,
                 points,
                 stroke.style.color.svg(),
-                stroke.style.width
+                stroke.style.width,
+                dash_attr(stroke.style.dashed)
             )
         }
-        Element::Text(text) => text
-            .text
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                format!(
-                    "<text data-inkstone-id=\"{}\" data-kind=\"text\" x=\"{}\" y=\"{}\" \
-                     font-family=\"sans-serif\" font-size=\"{}\" fill=\"{}\">{}</text>\n",
-                    text.id,
-                    text.origin.x,
-                    text.origin.y + index as f32 * text.font_size * 1.25,
-                    text.font_size,
-                    text.color.svg(),
-                    escape_xml(line)
-                )
-            })
-            .collect(),
+        Element::Text(text) => {
+            let weight = if text.bold { "bold" } else { "normal" };
+            let style = if text.italic { "italic" } else { "normal" };
+            let decoration = if text.underline || text.href.is_some() {
+                "underline"
+            } else {
+                "none"
+            };
+            text.text
+                .lines()
+                .enumerate()
+                .map(|(index, line)| {
+                    format!(
+                        "<text data-inkstone-id=\"{}\" data-kind=\"text\" x=\"{}\" y=\"{}\" \
+                         font-family=\"sans-serif\" font-size=\"{}\" font-weight=\"{weight}\" \
+                         font-style=\"{style}\" text-decoration=\"{decoration}\" fill=\"{}\">{}{}</text>\n",
+                        text.id,
+                        text.origin.x,
+                        text.origin.y + index as f32 * text.font_size * 1.25,
+                        text.font_size,
+                        text.color.svg(),
+                        escape_xml(text.prefix()),
+                        escape_xml(line)
+                    )
+                })
+                .collect()
+        }
         Element::Connector(connector) => {
             let mut points = vec![connector.start.point];
             points.extend_from_slice(&connector.route);
@@ -1052,13 +1742,14 @@ pub(crate) fn element_svg(element: &Element) -> String {
             format!(
                 "<polyline data-inkstone-id=\"{}\" data-kind=\"connector\" \
                  data-start-element=\"{}\" data-end-element=\"{}\" points=\"{}\" \
-                 fill=\"none\" stroke=\"{}\" stroke-width=\"{}\"/>\n",
+                 fill=\"none\" stroke=\"{}\" stroke-width=\"{}\"{}/>\n",
                 connector.id,
                 start,
                 end,
                 points,
                 connector.style.color.svg(),
-                connector.style.width
+                connector.style.width,
+                dash_attr(connector.style.dashed)
             )
         }
         Element::Shape(shape) => shape_svg(shape),
@@ -1083,11 +1774,77 @@ pub(crate) fn element_svg(element: &Element) -> String {
                 &media.caption
             })
         ),
+        Element::Table(table) => {
+            let mut svg = format!(
+                "<g data-inkstone-id=\"{}\" data-kind=\"table\">\
+                 <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#ffffff\" \
+                 stroke=\"#555555\" stroke-width=\"1\"/>",
+                table.id, table.bounds.x, table.bounds.y, table.bounds.width, table.bounds.height
+            );
+            let cell_w = table.bounds.width / table.columns.max(1) as f32;
+            let cell_h = table.bounds.height / table.rows.max(1) as f32;
+            for column in 1..table.columns {
+                let x = table.bounds.x + cell_w * column as f32;
+                svg.push_str(&format!(
+                    "<line x1=\"{x}\" y1=\"{}\" x2=\"{x}\" y2=\"{}\" stroke=\"#888888\"/>",
+                    table.bounds.y,
+                    table.bounds.y + table.bounds.height
+                ));
+            }
+            for row in 1..table.rows {
+                let y = table.bounds.y + cell_h * row as f32;
+                svg.push_str(&format!(
+                    "<line x1=\"{}\" y1=\"{y}\" x2=\"{}\" y2=\"{y}\" stroke=\"#888888\"/>",
+                    table.bounds.x,
+                    table.bounds.x + table.bounds.width
+                ));
+            }
+            for (index, cell) in table.cells.iter().enumerate() {
+                if cell.is_empty() {
+                    continue;
+                }
+                let column = (index as u32) % table.columns;
+                let row = (index as u32) / table.columns;
+                svg.push_str(&format!(
+                    "<text x=\"{}\" y=\"{}\" font-family=\"sans-serif\" font-size=\"12\" \
+                     fill=\"#222222\">{}</text>",
+                    table.bounds.x + cell_w * column as f32 + 6.0,
+                    table.bounds.y + cell_h * row as f32 + cell_h * 0.65,
+                    escape_xml(cell)
+                ));
+            }
+            svg.push_str("</g>\n");
+            svg
+        }
+        Element::Tag(tag) => {
+            let (width, height) = tag.size();
+            format!(
+                "<g data-inkstone-id=\"{}\" data-kind=\"tag\">\
+                 <rect x=\"{}\" y=\"{}\" width=\"{width}\" height=\"{height}\" rx=\"8\" \
+                 fill=\"{}\" fill-opacity=\"0.16\" stroke=\"{}\"/>\
+                 <text x=\"{}\" y=\"{}\" font-family=\"sans-serif\" font-size=\"13\" \
+                 fill=\"{}\">{} {}</text></g>\n",
+                tag.id,
+                tag.origin.x,
+                tag.origin.y,
+                tag.kind.color().svg(),
+                tag.kind.color().svg(),
+                tag.origin.x + 10.0,
+                tag.origin.y + 19.0,
+                tag.kind.color().svg(),
+                escape_xml(tag.kind.label()),
+                escape_xml(&tag.note)
+            )
+        }
     }
 }
 
 fn shape_svg(shape: &Shape) -> String {
-    let b = shape.bounds;
+    let b = if shape.kind.uses_drag_bounds() {
+        shape.bounds
+    } else {
+        shape.bounds.normalized()
+    };
     let stroke = shape.style.color.svg();
     let fill = shape
         .fill
@@ -1095,9 +1852,15 @@ fn shape_svg(shape: &Shape) -> String {
         .unwrap_or_else(|| "none".to_owned());
     let common = format!(
         "data-inkstone-id=\"{}\" data-kind=\"{:?}\" fill=\"{}\" stroke=\"{}\" \
-         stroke-width=\"{}\"",
-        shape.id, shape.kind, fill, stroke, shape.style.width
+         stroke-width=\"{}\"{}",
+        shape.id,
+        shape.kind,
+        fill,
+        stroke,
+        shape.style.width,
+        dash_attr(shape.style.dashed)
     );
+    let cy = b.center().y;
     let geometry = match shape.kind {
         ShapeKind::Rectangle | ShapeKind::Beam => format!(
             "<rect {common} x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/>",
@@ -1107,8 +1870,29 @@ fn shape_svg(shape: &Shape) -> String {
             "<ellipse {common} cx=\"{}\" cy=\"{}\" rx=\"{}\" ry=\"{}\"/>",
             b.center().x,
             b.center().y,
-            b.width / 2.0,
-            b.height / 2.0
+            b.width.abs() / 2.0,
+            b.height.abs() / 2.0
+        ),
+        ShapeKind::Line | ShapeKind::Arrow | ShapeKind::Dimension => {
+            let start = b.start();
+            let end = b.end();
+            let mut extra = String::new();
+            if shape.kind == ShapeKind::Arrow || shape.kind == ShapeKind::Dimension {
+                extra.push_str(&arrow_head_svg(start, end, b));
+            }
+            format!(
+                "<path {common} d=\"M {} {} L {} {}{extra}\" fill=\"none\"/>",
+                start.x, start.y, end.x, end.y
+            )
+        }
+        ShapeKind::Triangle => format!(
+            "<polygon {common} points=\"{} {},{} {},{} {}\"/>",
+            b.center().x,
+            b.y,
+            b.x + b.width,
+            b.y + b.height,
+            b.x,
+            b.y + b.height
         ),
         ShapeKind::Capacitor => {
             let x1 = b.x + b.width * 0.42;
@@ -1117,10 +1901,10 @@ fn shape_svg(shape: &Shape) -> String {
                 "<g {common}><path d=\"M {} {} H {} M {} {} H {} \
                  M {} {} V {} M {} {} V {}\" fill=\"none\"/></g>",
                 b.x,
-                b.center().y,
+                cy,
                 x1,
                 x2,
-                b.center().y,
+                cy,
                 b.x + b.width,
                 x1,
                 b.y,
@@ -1146,19 +1930,172 @@ fn shape_svg(shape: &Shape) -> String {
             b.y + b.height * 0.9,
             b.x + b.width * 0.64
         ),
-        ShapeKind::Resistor | ShapeKind::Spring => {
-            let mut path = format!("M {} {}", b.x, b.center().y);
-            for index in 0..=8 {
-                let x = b.x + b.width * (index as f32 + 1.0) / 10.0;
-                let y = if index % 2 == 0 {
-                    b.y + b.height * 0.2
-                } else {
-                    b.y + b.height * 0.8
-                };
-                path.push_str(&format!(" L {x} {y}"));
-            }
-            path.push_str(&format!(" L {} {}", b.x + b.width, b.center().y));
-            format!("<path {common} d=\"{path}\" fill=\"none\"/>")
+        ShapeKind::Resistor => {
+            let x1 = b.x + b.width * 0.22;
+            let x2 = b.x + b.width * 0.78;
+            let y1 = b.y + b.height * 0.28;
+            let y2 = b.y + b.height * 0.72;
+            format!(
+                "<g {common}><path d=\"M {0} {1} H {2} M {3} {1} H {4}\" fill=\"none\"/>\
+                 <rect x=\"{2}\" y=\"{5}\" width=\"{6}\" height=\"{7}\" fill=\"none\"/></g>",
+                b.x,
+                cy,
+                x1,
+                x2,
+                b.x + b.width,
+                y1,
+                (x2 - x1).abs(),
+                (y2 - y1).abs()
+            )
+        }
+        ShapeKind::Spring => zigzag_svg(&common, b),
+        ShapeKind::Diode => {
+            let mid = b.x + b.width * 0.62;
+            format!(
+                "<g {common}><path d=\"M {0} {1} H {2} M {3} {1} H {4} M {2} {5} L {3} {1} L {2} {6} Z \
+                 M {3} {5} V {6}\" fill=\"none\"/></g>",
+                b.x,
+                cy,
+                b.x + b.width * 0.28,
+                mid,
+                b.x + b.width,
+                b.y + b.height * 0.18,
+                b.y + b.height * 0.82
+            )
+        }
+        ShapeKind::Inductor => inductor_svg(&common, b),
+        ShapeKind::Switch => format!(
+            "<g {common}><path d=\"M {0} {1} H {2} M {3} {1} H {4} M {2} {1} L {5} {6}\" fill=\"none\"/>\
+             <circle cx=\"{2}\" cy=\"{1}\" r=\"2.4\" fill=\"none\"/>\
+             <circle cx=\"{3}\" cy=\"{1}\" r=\"2.4\" fill=\"none\"/></g>",
+            b.x,
+            cy,
+            b.x + b.width * 0.28,
+            b.x + b.width * 0.72,
+            b.x + b.width,
+            b.x + b.width * 0.62,
+            b.y + b.height * 0.18
+        ),
+        ShapeKind::Fuse => {
+            let x1 = b.x + b.width * 0.28;
+            let x2 = b.x + b.width * 0.72;
+            format!(
+                "<g {common}><path d=\"M {0} {1} H {2} M {3} {1} H {4} M {2} {1} H {3}\" fill=\"none\"/>\
+                 <rect x=\"{2}\" y=\"{5}\" width=\"{6}\" height=\"{7}\" fill=\"none\"/></g>",
+                b.x,
+                cy,
+                x1,
+                x2,
+                b.x + b.width,
+                b.y + b.height * 0.32,
+                (x2 - x1).abs(),
+                b.height * 0.36
+            )
+        }
+        ShapeKind::Battery => {
+            let x1 = b.x + b.width * 0.42;
+            let x2 = b.x + b.width * 0.58;
+            format!(
+                "<g {common}><path d=\"M {0} {1} H {2} M {3} {1} H {4} \
+                 M {2} {5} V {6} M {3} {7} V {8}\" fill=\"none\"/></g>",
+                b.x,
+                cy,
+                x1,
+                x2,
+                b.x + b.width,
+                b.y + b.height * 0.12,
+                b.y + b.height * 0.88,
+                b.y + b.height * 0.28,
+                b.y + b.height * 0.72
+            )
+        }
+        ShapeKind::Lamp => {
+            let cx = b.center().x;
+            let cy = b.center().y;
+            let r = b.width.abs().min(b.height.abs()) / 2.0;
+            format!(
+                "<g {common}><circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"none\"/>\
+                 <path d=\"M {0} {1} L {2} {3} M {0} {3} L {2} {1}\" fill=\"none\"/></g>",
+                cx - r * 0.62,
+                cy - r * 0.62,
+                cx + r * 0.62,
+                cy + r * 0.62
+            )
+        }
+        ShapeKind::Transformer => {
+            let left = inductor_svg(
+                &common,
+                Rect {
+                    x: b.x,
+                    y: b.y,
+                    width: b.width * 0.42,
+                    height: b.height,
+                },
+            );
+            let right = inductor_svg(
+                &common,
+                Rect {
+                    x: b.x + b.width * 0.58,
+                    y: b.y,
+                    width: b.width * 0.42,
+                    height: b.height,
+                },
+            );
+            format!(
+                "<g {common}>{left}{right}<path d=\"M {0} {1} V {2} M {3} {1} V {2}\" fill=\"none\"/></g>",
+                b.x + b.width * 0.46,
+                b.y + b.height * 0.18,
+                b.y + b.height * 0.82,
+                b.x + b.width * 0.54
+            )
+        }
+        ShapeKind::AndGate | ShapeKind::NandGate => {
+            logic_and_svg(&common, b, shape.kind == ShapeKind::NandGate)
+        }
+        ShapeKind::OrGate | ShapeKind::NorGate | ShapeKind::XorGate => {
+            logic_or_svg(&common, b, shape.kind)
+        }
+        ShapeKind::NotGate => {
+            let tip = b.x + b.width * 0.72;
+            format!(
+                "<g {common}><path d=\"M {0} {1} L {2} {3} L {0} {4} Z\" fill=\"none\"/>\
+                 <circle cx=\"{5}\" cy=\"{3}\" r=\"{6}\" fill=\"none\"/>\
+                 <path d=\"M {5} {3} H {7}\" fill=\"none\"/></g>",
+                b.x,
+                b.y,
+                tip,
+                cy,
+                b.y + b.height,
+                b.x + b.width * 0.82,
+                b.width.abs() * 0.08,
+                b.x + b.width
+            )
+        }
+        ShapeKind::SurfaceFinish => format!(
+            "<g {common}><path d=\"M {0} {1} L {2} {3} L {4} {5}\" fill=\"none\"/></g>",
+            b.x,
+            b.y + b.height * 0.62,
+            b.x + b.width * 0.32,
+            b.y + b.height,
+            b.x + b.width,
+            b.y
+        ),
+        ShapeKind::ThirdAngle => {
+            let cx = b.center().x;
+            let cy = b.center().y;
+            let r = b.width.abs().min(b.height.abs()) * 0.38;
+            format!(
+                "<g {common}><circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"none\"/>\
+                 <circle cx=\"{cx}\" cy=\"{cy}\" r=\"{0}\" fill=\"none\"/>\
+                 <path d=\"M {1} {2} L {3} {4} L {5} {4} L {6} {2} Z\" fill=\"none\"/></g>",
+                r * 0.42,
+                b.x + b.width * 0.18,
+                b.y,
+                b.x + b.width * 0.32,
+                b.y + b.height * 0.18,
+                b.x + b.width * 0.68,
+                b.x + b.width * 0.82
+            )
         }
     };
     let label = if shape.label.is_empty() {
@@ -1168,12 +2105,126 @@ fn shape_svg(shape: &Shape) -> String {
             "<text x=\"{}\" y=\"{}\" font-family=\"sans-serif\" font-size=\"14\" \
              text-anchor=\"middle\" fill=\"{}\">{}</text>",
             b.center().x,
-            b.y + b.height + 18.0,
+            b.y.min(b.y + b.height) + b.height.abs() + 18.0,
             stroke,
             escape_xml(&shape.label)
         )
     };
     format!("{geometry}{label}\n")
+}
+
+fn arrow_head_svg(start: Point, end: Point, bounds: Rect) -> String {
+    let angle = (end.y - start.y).atan2(end.x - start.x);
+    let size = (bounds.width.abs().hypot(bounds.height.abs()) * 0.18).clamp(8.0, 22.0);
+    format!(
+        " M {} {} L {} {} M {} {} L {} {}",
+        end.x,
+        end.y,
+        end.x - size * (angle - 0.45).cos(),
+        end.y - size * (angle - 0.45).sin(),
+        end.x,
+        end.y,
+        end.x - size * (angle + 0.45).cos(),
+        end.y - size * (angle + 0.45).sin()
+    )
+}
+
+fn zigzag_svg(common: &str, b: Rect) -> String {
+    let mut path = format!("M {} {}", b.x, b.center().y);
+    for index in 0..=8 {
+        let x = b.x + b.width * (index as f32 + 1.0) / 10.0;
+        let y = if index % 2 == 0 {
+            b.y + b.height * 0.2
+        } else {
+            b.y + b.height * 0.8
+        };
+        path.push_str(&format!(" L {x} {y}"));
+    }
+    path.push_str(&format!(" L {} {}", b.x + b.width, b.center().y));
+    format!("<path {common} d=\"{path}\" fill=\"none\"/>")
+}
+
+fn inductor_svg(common: &str, b: Rect) -> String {
+    let cy = b.center().y;
+    let radius = b.width.abs() / 10.0;
+    let mut path = format!("M {} {}", b.x, cy);
+    path.push_str(&format!(" H {}", b.x + b.width * 0.18));
+    for index in 0..4 {
+        let cx = b.x + b.width * (0.26 + index as f32 * 0.14);
+        path.push_str(&format!(
+            " A {radius} {radius} 0 0 1 {} {}",
+            cx + radius,
+            cy
+        ));
+    }
+    path.push_str(&format!(" H {}", b.x + b.width));
+    format!("<path {common} d=\"{path}\" fill=\"none\"/>")
+}
+
+fn logic_and_svg(common: &str, b: Rect, nand: bool) -> String {
+    let mid = b.x + b.width * 0.55;
+    let bubble = b.x + b.width * 0.82;
+    let cy = b.center().y;
+    let bubble_r = b.width.abs() * 0.08;
+    let extra = if nand {
+        format!(
+            "<circle cx=\"{bubble}\" cy=\"{cy}\" r=\"{bubble_r}\" fill=\"none\"/>\
+             <path d=\"M {0} {cy} H {1}\" fill=\"none\"/>",
+            bubble + bubble_r,
+            b.x + b.width
+        )
+    } else {
+        format!(
+            "<path d=\"M {mid} {cy} H {}\" fill=\"none\"/>",
+            b.x + b.width
+        )
+    };
+    format!(
+        "<g {common}><path d=\"M {0} {1} H {mid} A {2} {3} 0 0 1 {mid} {4} H {0} Z\" fill=\"none\"/>\
+         {extra}</g>",
+        b.x,
+        b.y,
+        b.width * 0.35,
+        b.height / 2.0,
+        b.y + b.height
+    )
+}
+
+fn logic_or_svg(common: &str, b: Rect, kind: ShapeKind) -> String {
+    let cy = b.center().y;
+    let tip = b.x + b.width * 0.78;
+    let xor = if kind == ShapeKind::XorGate {
+        format!(
+            "<path d=\"M {0} {1} Q {2} {cy} {0} {3}\" fill=\"none\"/>",
+            b.x + b.width * 0.08,
+            b.y,
+            b.x + b.width * 0.22,
+            b.y + b.height
+        )
+    } else {
+        String::new()
+    };
+    let bubble = if matches!(kind, ShapeKind::NorGate) {
+        let cx = b.x + b.width * 0.86;
+        let r = b.width.abs() * 0.07;
+        format!("<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"none\"/>")
+    } else {
+        format!(
+            "<path d=\"M {tip} {cy} H {}\" fill=\"none\"/>",
+            b.x + b.width
+        )
+    };
+    format!(
+        "<g {common}><path d=\"M {0} {1} Q {2} {cy} {0} {3} Q {4} {5} {tip} {cy} Q {4} {6} {0} {1}\" fill=\"none\"/>\
+         {xor}{bubble}</g>",
+        b.x,
+        b.y,
+        b.x + b.width * 0.18,
+        b.y + b.height,
+        b.x + b.width * 0.42,
+        b.y + b.height * 0.78,
+        b.y + b.height * 0.22
+    )
 }
 
 pub(crate) fn escape_xml(value: &str) -> String {
@@ -1183,4 +2234,282 @@ pub(crate) fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn dash_attr(dashed: bool) -> &'static str {
+    if dashed {
+        " stroke-dasharray=\"8 6\""
+    } else {
+        ""
+    }
+}
+
+pub fn import_svg_elements(svg: &str) -> Result<Vec<Element>, DocumentError> {
+    let mut elements = Vec::new();
+    let mut rest = svg;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start..];
+        if rest.starts_with("<!--") {
+            rest = rest.split_once("-->").map(|(_, tail)| tail).unwrap_or("");
+            continue;
+        }
+        if rest.starts_with("<?") || rest.starts_with("<!") {
+            rest = rest.split_once('>').map(|(_, tail)| tail).unwrap_or("");
+            continue;
+        }
+        if rest.starts_with("</") {
+            rest = rest.split_once('>').map(|(_, tail)| tail).unwrap_or("");
+            continue;
+        }
+        let name_end = rest[1..]
+            .find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+            .unwrap_or(0)
+            + 1;
+        let name = rest[1..name_end].trim().to_ascii_lowercase();
+        let (tag, after) = if name == "text" {
+            let close = rest.find("</text>").unwrap_or(rest.len());
+            let end = (close + "</text>".len()).min(rest.len());
+            (&rest[..end], &rest[end..])
+        } else {
+            let close = rest.find('>').unwrap_or(rest.len().saturating_sub(1));
+            let end = (close + 1).min(rest.len());
+            (&rest[..end], &rest[end..])
+        };
+        rest = after;
+        match name.as_str() {
+            "polyline" | "polygon" => {
+                if let Some(element) = svg_polyline(tag, name == "polygon") {
+                    elements.push(element);
+                }
+            }
+            "line" => {
+                if let Some(element) = svg_line(tag) {
+                    elements.push(element);
+                }
+            }
+            "rect" => {
+                if let Some(element) = svg_rect(tag) {
+                    elements.push(element);
+                }
+            }
+            "ellipse" | "circle" => {
+                if let Some(element) = svg_ellipse(tag, name == "circle") {
+                    elements.push(element);
+                }
+            }
+            "text" => {
+                if let Some(element) = svg_text(tag) {
+                    elements.push(element);
+                }
+            }
+            "path" => {
+                if let Some(element) = svg_path(tag) {
+                    elements.push(element);
+                }
+            }
+            _ => {}
+        }
+    }
+    if elements.is_empty() {
+        return Err(DocumentError::Invalid(
+            "the SVG file did not contain drawable shapes, strokes, or text".to_owned(),
+        ));
+    }
+    Ok(elements)
+}
+
+fn svg_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some(index) = tag.find(&needle) {
+            let start = index + needle.len();
+            let end = tag[start..].find(quote)?;
+            return Some(&tag[start..start + end]);
+        }
+    }
+    None
+}
+
+fn svg_f32(tag: &str, name: &str) -> Option<f32> {
+    svg_attr(tag, name)?.trim().parse().ok()
+}
+
+fn svg_style(tag: &str) -> StrokeStyle {
+    let color = svg_attr(tag, "stroke")
+        .and_then(Color::parse)
+        .or_else(|| svg_attr(tag, "fill").and_then(Color::parse))
+        .unwrap_or(Color::INK);
+    let width = svg_f32(tag, "stroke-width")
+        .unwrap_or(2.0)
+        .max(MIN_STROKE_WIDTH);
+    StrokeStyle {
+        color,
+        width: width.min(MAX_STROKE_WIDTH),
+        dashed: svg_attr(tag, "stroke-dasharray")
+            .is_some_and(|value| !value.trim().is_empty() && value.trim() != "none"),
+    }
+}
+
+fn svg_id(tag: &str) -> Uuid {
+    svg_attr(tag, "data-inkstone-id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(Uuid::new_v4)
+}
+
+fn parse_svg_points(value: &str) -> Vec<Point> {
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(number) = current.parse::<f32>() {
+                numbers.push(number);
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty()
+        && let Ok(number) = current.parse::<f32>()
+    {
+        numbers.push(number);
+    }
+    numbers
+        .chunks(2)
+        .filter_map(|pair| (pair.len() == 2).then_some(Point::new(pair[0], pair[1])))
+        .collect()
+}
+
+fn svg_polyline(tag: &str, closed: bool) -> Option<Element> {
+    let mut points = parse_svg_points(svg_attr(tag, "points")?);
+    if points.len() < 2 {
+        return None;
+    }
+    if closed && points.first() != points.last() {
+        points.push(points[0]);
+    }
+    Some(Element::Stroke(Stroke {
+        id: svg_id(tag),
+        kind: StrokeKind::Pen,
+        style: svg_style(tag),
+        points: points
+            .into_iter()
+            .map(|point| StrokePoint::new(point, 1.0))
+            .collect(),
+    }))
+}
+
+fn svg_line(tag: &str) -> Option<Element> {
+    let start = Point::new(svg_f32(tag, "x1")?, svg_f32(tag, "y1")?);
+    let end = Point::new(svg_f32(tag, "x2")?, svg_f32(tag, "y2")?);
+    Some(Element::Shape(Shape {
+        id: svg_id(tag),
+        kind: ShapeKind::Line,
+        bounds: Rect::from_points(start, end),
+        rotation_degrees: 0.0,
+        style: svg_style(tag),
+        fill: None,
+        label: String::new(),
+    }))
+}
+
+fn svg_rect(tag: &str) -> Option<Element> {
+    let bounds = Rect {
+        x: svg_f32(tag, "x").unwrap_or(0.0),
+        y: svg_f32(tag, "y").unwrap_or(0.0),
+        width: svg_f32(tag, "width")?,
+        height: svg_f32(tag, "height")?,
+    };
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
+    }
+    Some(Element::Shape(Shape {
+        id: svg_id(tag),
+        kind: ShapeKind::Rectangle,
+        bounds,
+        rotation_degrees: 0.0,
+        style: svg_style(tag),
+        fill: svg_attr(tag, "fill")
+            .filter(|value| *value != "none")
+            .and_then(Color::parse),
+        label: String::new(),
+    }))
+}
+
+fn svg_ellipse(tag: &str, circle: bool) -> Option<Element> {
+    let cx = svg_f32(tag, "cx")?;
+    let cy = svg_f32(tag, "cy")?;
+    let (rx, ry) = if circle {
+        let r = svg_f32(tag, "r")?;
+        (r, r)
+    } else {
+        (svg_f32(tag, "rx")?, svg_f32(tag, "ry")?)
+    };
+    if rx <= 0.0 || ry <= 0.0 {
+        return None;
+    }
+    Some(Element::Shape(Shape {
+        id: svg_id(tag),
+        kind: ShapeKind::Ellipse,
+        bounds: Rect {
+            x: cx - rx,
+            y: cy - ry,
+            width: rx * 2.0,
+            height: ry * 2.0,
+        },
+        rotation_degrees: 0.0,
+        style: svg_style(tag),
+        fill: svg_attr(tag, "fill")
+            .filter(|value| *value != "none")
+            .and_then(Color::parse),
+        label: String::new(),
+    }))
+}
+
+fn svg_text(tag: &str) -> Option<Element> {
+    let inner = tag.split_once('>')?.1;
+    let text = inner
+        .split("</text>")
+        .next()?
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .trim()
+        .to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let font_size = svg_f32(tag, "font-size").unwrap_or(18.0).max(4.0);
+    let mut note = TextNote::plain(
+        Point::new(
+            svg_f32(tag, "x").unwrap_or(0.0),
+            svg_f32(tag, "y").unwrap_or(0.0),
+        ),
+        text,
+        font_size,
+        svg_attr(tag, "fill")
+            .and_then(Color::parse)
+            .unwrap_or(Color::INK),
+    );
+    note.id = svg_id(tag);
+    Some(Element::Text(note))
+}
+
+fn svg_path(tag: &str) -> Option<Element> {
+    let data = svg_attr(tag, "d")?;
+    let points = parse_svg_points(data);
+    if points.len() < 2 {
+        return None;
+    }
+    Some(Element::Stroke(Stroke {
+        id: svg_id(tag),
+        kind: StrokeKind::Pen,
+        style: svg_style(tag),
+        points: points
+            .into_iter()
+            .map(|point| StrokePoint::new(point, 1.0))
+            .collect(),
+    }))
 }

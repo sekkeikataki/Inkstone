@@ -3,5 +3,8 @@ pub mod app;
 #[cfg(feature = "desktop")]
 pub mod canvas;
 pub mod document;
+pub mod library;
+pub mod local;
 pub mod notebook;
+pub mod pdf;
 pub mod spreadsheet;

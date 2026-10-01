@@ -1,0 +1,360 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://inkstone.dev/schema/inkstone-v3.schema.json",
+  "title": "Inkstone notebook v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "version", "title", "pages", "assets", "sections"],
+  "properties": {
+    "format": { "const": "inkstone.notebook" },
+    "version": { "const": 3 },
+    "title": { "type": "string" },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/section" }
+    },
+    "active_section": { "$ref": "#/$defs/uuid" },
+    "pages": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/page" }
+    },
+    "assets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "trash": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/page" }
+    },
+    "color": { "$ref": "#/$defs/color" }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      }
+    },
+    "rect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "type": "number" },
+        "height": { "type": "number" }
+      }
+    },
+    "color": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["red", "green", "blue", "alpha"],
+      "properties": {
+        "red": { "type": "number", "minimum": 0, "maximum": 1 },
+        "green": { "type": "number", "minimum": 0, "maximum": 1 },
+        "blue": { "type": "number", "minimum": 0, "maximum": 1 },
+        "alpha": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "style": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["color", "width"],
+      "properties": {
+        "color": { "$ref": "#/$defs/color" },
+        "width": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["background", "grid_spacing", "grid_visible"],
+      "properties": {
+        "background": { "$ref": "#/$defs/color" },
+        "grid_spacing": { "type": "number", "exclusiveMinimum": 0 },
+        "grid_visible": { "type": "boolean" },
+        "pattern": { "enum": ["none", "grid", "dots", "lines"] },
+        "layout": { "enum": ["infinite", "fixed", "continuous_vertical"] },
+        "page_width": { "type": "number", "exclusiveMinimum": 0 },
+        "page_height": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "media_type", "data_base64"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1 },
+        "media_type": { "type": "string", "minLength": 1 },
+        "data_base64": { "type": "string", "contentEncoding": "base64" }
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "color"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1 },
+        "color": { "$ref": "#/$defs/color" }
+      }
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "canvas", "layers"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "title": { "type": "string" },
+        "section_id": { "$ref": "#/$defs/uuid" },
+        "level": { "type": "integer", "minimum": 0 },
+        "canvas": { "$ref": "#/$defs/canvas" },
+        "layers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/layer" }
+        }
+      }
+    },
+    "layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "visible", "locked", "elements"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string" },
+        "visible": { "type": "boolean" },
+        "locked": { "type": "boolean" },
+        "elements": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/stroke" },
+              { "$ref": "#/$defs/text" },
+              { "$ref": "#/$defs/shape" },
+              { "$ref": "#/$defs/connector" },
+              { "$ref": "#/$defs/media" },
+              { "$ref": "#/$defs/table" },
+              { "$ref": "#/$defs/tag" }
+            ]
+          }
+        }
+      }
+    },
+    "strokePoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "pressure"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "pressure": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "stroke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "kind", "style", "points"],
+      "properties": {
+        "type": { "const": "stroke" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "kind": { "enum": ["pen", "highlighter"] },
+        "style": { "$ref": "#/$defs/style" },
+        "points": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/strokePoint" }
+        }
+      }
+    },
+    "text": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "origin", "text", "font_size", "color", "max_width"],
+      "properties": {
+        "type": { "const": "text" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "origin": { "$ref": "#/$defs/point" },
+        "text": { "type": "string", "minLength": 1 },
+        "font_size": { "type": "number", "exclusiveMinimum": 0 },
+        "color": { "$ref": "#/$defs/color" },
+        "max_width": {
+          "anyOf": [
+            { "type": "number", "exclusiveMinimum": 0 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "kind",
+        "bounds",
+        "rotation_degrees",
+        "style",
+        "fill",
+        "label"
+      ],
+      "properties": {
+        "type": { "const": "shape" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "kind": {
+          "enum": [
+            "rectangle",
+            "ellipse",
+            "line",
+            "arrow",
+            "triangle",
+            "resistor",
+            "capacitor",
+            "diode",
+            "inductor",
+            "switch",
+            "fuse",
+            "battery",
+            "ground",
+            "lamp",
+            "transformer",
+            "and_gate",
+            "or_gate",
+            "not_gate",
+            "nand_gate",
+            "nor_gate",
+            "xor_gate",
+            "motor",
+            "gear",
+            "bearing",
+            "spring",
+            "beam",
+            "dimension",
+            "surface_finish",
+            "third_angle"
+          ]
+        },
+        "bounds": { "$ref": "#/$defs/rect" },
+        "rotation_degrees": { "type": "number" },
+        "style": { "$ref": "#/$defs/style" },
+        "fill": {
+          "anyOf": [
+            { "$ref": "#/$defs/color" },
+            { "type": "null" }
+          ]
+        },
+        "label": { "type": "string" }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["element_id", "anchor"],
+      "properties": {
+        "element_id": { "$ref": "#/$defs/uuid" },
+        "anchor": {
+          "enum": ["north", "east", "south", "west", "center", "start", "end"]
+        }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["point", "attachment"],
+      "properties": {
+        "point": { "$ref": "#/$defs/point" },
+        "attachment": {
+          "anyOf": [
+            { "$ref": "#/$defs/attachment" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "start", "end", "route", "style", "label"],
+      "properties": {
+        "type": { "const": "connector" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "start": { "$ref": "#/$defs/endpoint" },
+        "end": { "$ref": "#/$defs/endpoint" },
+        "route": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/point" }
+        },
+        "style": { "$ref": "#/$defs/style" },
+        "label": { "type": "string" }
+      }
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "asset_id", "kind", "bounds", "alt_text", "caption"],
+      "properties": {
+        "type": { "const": "media" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "asset_id": { "$ref": "#/$defs/uuid" },
+        "kind": { "enum": ["image", "pdf", "file", "audio"] },
+        "bounds": { "$ref": "#/$defs/rect" },
+        "alt_text": { "type": "string" },
+        "caption": { "type": "string" }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "bounds", "columns", "rows", "cells"],
+      "properties": {
+        "type": { "const": "table" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "bounds": { "$ref": "#/$defs/rect" },
+        "columns": { "type": "integer", "minimum": 1 },
+        "rows": { "type": "integer", "minimum": 1 },
+        "cells": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "tag": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "origin", "kind", "note", "checked"],
+      "properties": {
+        "type": { "const": "tag" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "origin": { "$ref": "#/$defs/point" },
+        "kind": {
+          "enum": [
+            "to_do",
+            "important",
+            "question",
+            "idea",
+            "critical",
+            "definition",
+            "contact",
+            "address",
+            "phone",
+            "date"
+          ]
+        },
+        "note": { "type": "string", "minLength": 1 },
+        "checked": { "type": "boolean" }
+      }
+    }
+  }
+}

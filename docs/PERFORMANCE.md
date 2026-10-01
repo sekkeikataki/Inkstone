@@ -11,12 +11,13 @@ not run a web engine, background renderer, animation loop, network service, or i
   without reducing visible detail at the current zoom.
 - Drawing is queued only after input, edits, or view changes. A static note consumes no continuous
   render CPU.
-- Sidebar, toast, and tool-option transitions use libadwaita's native animation machinery and short
-  GTK CSS fades. Keyboard zoom uses a GTK frame-clock tick callback for a 180 ms ease-out, then
-  stops; superseded zooms cancel the previous callback. Page switches and new selections use the
-  same short tick (page fade / selection flash) and then stop. Drawing hides chrome via GtkRevealer
-  and AdwToolbarView, which unreveal after the stroke ends. Reduced-motion desktops skip these
-  eases. No idle animation loop runs while the notebook is still.
+- Sidebar, toast, and tool-option transitions use libadwaita's native animation machinery.
+  Keyboard zoom uses a GTK frame-clock tick callback for a 180 ms ease-out, then stops;
+  superseded zooms cancel the previous callback. Page switches and new selections use the
+  same short tick (page fade / selection flash) and then stop. Drawing tools stay on screen
+  while you ink; the Tools button (F10) hides the header and canvas chrome until you show
+  them again. Reduced-motion desktops skip remaining eases. No idle animation loop runs
+  while the notebook is still.
 - Autosave uses a generation-based, one-shot two-second debounce after edits and only activates
   after a destination has been chosen. It does not poll, and stale timers exit without writing.
 - Elements outside the expanded viewport are rejected by a cheap bounds test before Cairo work.

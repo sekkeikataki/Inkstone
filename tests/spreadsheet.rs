@@ -283,8 +283,10 @@ fn notes_documents_without_kind_still_load() {
       }],
       "assets": []
     }"#;
-    let notebook: Notebook = serde_json::from_str(json).unwrap();
-    notebook.validate().unwrap();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy.inkstone");
+    std::fs::write(&path, json).unwrap();
+    let notebook = Notebook::load(&path).unwrap();
     assert_eq!(notebook.pages[0].layers[0].kind, LayerKind::Notes);
 }
 
