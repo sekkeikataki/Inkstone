@@ -998,6 +998,9 @@ impl Canvas {
         state.notebook = notebook;
         state.active_page = 0;
         state.active_layer = 0;
+        if let Some(first_page) = state.notebook.pages.first() {
+            state.notebook.active_section = first_page.section_id;
+        }
         state.path = Some(path.to_owned());
         state.history.clear();
         state.redo.clear();

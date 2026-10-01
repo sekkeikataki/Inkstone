@@ -528,11 +528,30 @@ struct BatchPage {
 struct BatchBlock {
     #[serde(rename = "type")]
     block_type: String,
+    #[serde(default)]
     text: String,
     #[serde(default)]
     level: Option<u32>,
     #[serde(default)]
     checked: Option<bool>,
+    #[serde(default)]
+    shape_kind: Option<String>,
+    #[serde(default)]
+    x: Option<f32>,
+    #[serde(default)]
+    y: Option<f32>,
+    #[serde(default)]
+    width: Option<f32>,
+    #[serde(default)]
+    height: Option<f32>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    color: Option<[f32; 3]>,
+    #[serde(default)]
+    points: Option<Vec<[f32; 2]>>,
+    #[serde(default)]
+    stroke_width: Option<f32>,
 }
 
 fn cmd_batch(args: &[String]) -> u8 {
@@ -617,14 +636,14 @@ fn cmd_batch(args: &[String]) -> u8 {
 
         let mut y = if elements.is_empty() { 60.0 } else { 80.0 };
         for b in bp.blocks {
-            let elem = match b.block_type.as_str() {
+            match b.block_type.as_str() {
                 "h1" | "heading1" => {
                     y += 20.0;
                     let mut note = TextNote::plain(Point::new(60.0, y), b.text, 24.0, Color::INK);
                     note.bold = true;
                     note.max_width = Some(800.0);
                     y += 40.0;
-                    Element::Text(note)
+                    elements.push(Element::Text(note));
                 }
                 "h2" | "heading2" => {
                     y += 15.0;
@@ -632,7 +651,7 @@ fn cmd_batch(args: &[String]) -> u8 {
                     note.bold = true;
                     note.max_width = Some(800.0);
                     y += 32.0;
-                    Element::Text(note)
+                    elements.push(Element::Text(note));
                 }
                 "h3" | "heading3" => {
                     y += 10.0;
@@ -640,7 +659,7 @@ fn cmd_batch(args: &[String]) -> u8 {
                     note.bold = true;
                     note.max_width = Some(800.0);
                     y += 26.0;
-                    Element::Text(note)
+                    elements.push(Element::Text(note));
                 }
                 "bullet" => {
                     let lines = b.text.lines().count().max(1);
@@ -648,7 +667,7 @@ fn cmd_batch(args: &[String]) -> u8 {
                     note.list = ListStyle::Bullet;
                     note.max_width = Some(800.0);
                     y += (lines as f32) * 20.0 + 8.0;
-                    Element::Text(note)
+                    elements.push(Element::Text(note));
                 }
                 "todo" => {
                     let mut note = TextNote::plain(Point::new(60.0, y), b.text, 14.0, Color::INK);
@@ -656,17 +675,80 @@ fn cmd_batch(args: &[String]) -> u8 {
                     note.checked = b.checked.unwrap_or(false);
                     note.max_width = Some(800.0);
                     y += 25.0;
-                    Element::Text(note)
+                    elements.push(Element::Text(note));
+                }
+                "shape" => {
+                    use crate::document::{Rect, Shape, ShapeKind, StrokeStyle};
+                    let kind: ShapeKind = b
+                        .shape_kind
+                        .as_deref()
+                        .and_then(|s| {
+                            serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+                        })
+                        .unwrap_or(ShapeKind::Rectangle);
+                    let col = b
+                        .color
+                        .map(|[r, g, b]| Color::rgb(r, g, b))
+                        .unwrap_or(Color::INK);
+                    let shape = Shape {
+                        id: Uuid::new_v4(),
+                        kind,
+                        bounds: Rect {
+                            x: b.x.unwrap_or(60.0),
+                            y: b.y.unwrap_or(y),
+                            width: b.width.unwrap_or(120.0),
+                            height: b.height.unwrap_or(60.0),
+                        },
+                        rotation_degrees: 0.0,
+                        style: StrokeStyle {
+                            color: col,
+                            width: b.stroke_width.unwrap_or(1.5),
+                            dashed: false,
+                        },
+                        fill: None,
+                        label: b.label.unwrap_or_default(),
+                    };
+                    y = y.max(shape.bounds.y + shape.bounds.height + 15.0);
+                    elements.push(Element::Shape(shape));
+                }
+                "stroke" | "draw" => {
+                    use crate::document::{Stroke, StrokeKind, StrokePoint, StrokeStyle};
+                    let col = b
+                        .color
+                        .map(|[r, g, b]| Color::rgb(r, g, b))
+                        .unwrap_or(Color::BLUE);
+                    let pts: Vec<StrokePoint> = b
+                        .points
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|[px, py]| StrokePoint {
+                            x: px,
+                            y: py,
+                            pressure: 0.8,
+                        })
+                        .collect();
+                    if pts.len() >= 2 {
+                        let stroke = Stroke {
+                            id: Uuid::new_v4(),
+                            kind: StrokeKind::Pen,
+                            style: StrokeStyle {
+                                color: col,
+                                width: b.stroke_width.unwrap_or(2.0),
+                                dashed: false,
+                            },
+                            points: pts,
+                        };
+                        elements.push(Element::Stroke(stroke));
+                    }
                 }
                 _ => {
                     let lines = b.text.lines().count().max(1);
                     let mut note = TextNote::plain(Point::new(60.0, y), b.text, 14.0, Color::INK);
                     note.max_width = Some(800.0);
                     y += (lines as f32) * 20.0 + 12.0;
-                    Element::Text(note)
+                    elements.push(Element::Text(note));
                 }
-            };
-            elements.push(elem);
+            }
         }
 
         if let Some(layer) = page.layers.first_mut() {
@@ -680,6 +762,10 @@ fn cmd_batch(args: &[String]) -> u8 {
         } else {
             notebook.pages.push(page);
         }
+    }
+
+    if let Some(first) = notebook.pages.first() {
+        notebook.active_section = first.section_id;
     }
 
     if let Err(e) = notebook.save(path) {

@@ -1128,7 +1128,7 @@ impl Navigator {
                 let Some(path) = row.map(|row| PathBuf::from(row.widget_name().as_str())) else {
                     return;
                 };
-                if path.as_os_str().is_empty() || !path.exists() {
+                if path.as_os_str().is_empty() || !path.is_file() {
                     return;
                 }
                 if canvas.current_path().as_deref() == Some(path.as_path()) {
