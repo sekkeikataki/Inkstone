@@ -3,10 +3,11 @@ use inkstone::document::{
     StrokeKind, StrokePoint, StrokeStyle, mm_to_pt, pt_to_mm,
 };
 use inkstone::local::{
-    AlignMode, ISO_DATETIME, PageTemplate, align_bounds, constrain_to_square, dimension_label,
-    evaluate_equation, parse_page_link_href, parse_page_links, replay_duration, replay_progress,
-    replay_timeline, snap_to_iso_angle, snap_to_ruler, split_stroke, stabilize_point,
-    stroke_path_length, stroke_prefix, stroke_to_shape,
+    AlignMode, EquationError, ISO_DATETIME, PageTemplate, align_bounds, constrain_to_square,
+    dimension_label, evaluate_equation, evaluate_equation_result, parse_page_link_href,
+    parse_page_links, replay_duration, replay_progress, replay_timeline, snap_to_iso_angle,
+    snap_to_ruler, split_stroke, stabilize_point, stroke_path_length, stroke_prefix,
+    stroke_to_shape,
 };
 use inkstone::notebook::Notebook;
 use uuid::Uuid;
@@ -18,6 +19,22 @@ fn calculate_completes_simple_equations() {
     assert_eq!(evaluate_equation("10/4=").as_deref(), Some("10/4= 2.5"));
     assert!(evaluate_equation("hello=").is_none());
     assert!(evaluate_equation("2+2").is_none());
+    assert_eq!(
+        evaluate_equation_result("1.2.3="),
+        Err(EquationError::InvalidNumber("1.2.3".to_owned()))
+    );
+    assert_eq!(
+        evaluate_equation_result("..5="),
+        Err(EquationError::InvalidNumber("..5".to_owned()))
+    );
+    assert_eq!(
+        evaluate_equation_result(".="),
+        Err(EquationError::InvalidNumber(".".to_owned()))
+    );
+    assert_eq!(
+        evaluate_equation_result("10/0="),
+        Err(EquationError::DivideByZero)
+    );
 }
 
 #[test]

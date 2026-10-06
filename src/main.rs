@@ -4,5 +4,5 @@ fn main() -> gtk4::glib::ExitCode {
         let code = inkstone::cli::run(&args[1..]);
         return gtk4::glib::ExitCode::from(code);
     }
-    inkstone::app::run()
+    inkstone::app::run_with_args(&args)
 }

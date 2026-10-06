@@ -90,10 +90,77 @@ impl Feedback {
     }
 }
 
+#[derive(Clone)]
+struct AppState {
+    window: adw::ApplicationWindow,
+    canvas: Canvas,
+    navigator: Navigator,
+    feedback: Feedback,
+}
+
 pub fn run() -> glib::ExitCode {
-    let application = adw::Application::builder().application_id(APP_ID).build();
-    application.connect_activate(build_window);
-    application.run()
+    let args: Vec<String> = std::env::args().collect();
+    run_with_args(&args)
+}
+
+pub fn run_with_args<S: AsRef<str>>(args: &[S]) -> glib::ExitCode {
+    let application = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
+
+    let app_state: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+
+    application.connect_activate({
+        let app_state = app_state.clone();
+        move |application| {
+            if let Some(state) = app_state.borrow().as_ref() {
+                state.window.present();
+            } else {
+                let state = build_window(application, None);
+                *app_state.borrow_mut() = Some(state);
+            }
+        }
+    });
+
+    application.connect_open({
+        let app_state = app_state.clone();
+        move |application, files, _hint| {
+            let first_file = files.first().and_then(|f| f.path());
+            if app_state.borrow().is_none() {
+                let state = build_window(application, first_file.as_deref());
+                for file in files.iter().skip(1) {
+                    if let Some(p) = file.path() {
+                        let mut open = state.navigator.open_paths.borrow_mut();
+                        if !open.iter().any(|item| item == &p) {
+                            open.push(p);
+                        }
+                    }
+                }
+                state.navigator.refresh_tabs(&state.canvas);
+                *app_state.borrow_mut() = Some(state);
+            } else if let Some(state) = app_state.borrow().as_ref() {
+                for file in files {
+                    if let Some(path) = file.path() {
+                        if state.canvas.is_dirty() && state.navigator.session.borrow().preferences.save_on_switch {
+                            let _ = state.canvas.save_current();
+                        }
+                        if let Err(error) = state.canvas.load(&path) {
+                            state.feedback.show(error.to_string());
+                        } else {
+                            let _ = state.navigator.session.borrow_mut().remember(&path);
+                            state.navigator.refresh(&state.canvas);
+                            state.navigator.refresh_library(&state.canvas);
+                            state.feedback.whisper("Opened notebook");
+                        }
+                    }
+                }
+                state.window.present();
+            }
+        }
+    });
+
+    application.run_with_args(args)
 }
 
 fn install_css() {
@@ -417,7 +484,7 @@ fn icon_search_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn build_window(application: &adw::Application) {
+fn build_window(application: &adw::Application, initial_path: Option<&Path>) -> AppState {
     install_css();
     let canvas = Canvas::new();
     let window = adw::ApplicationWindow::builder()
@@ -475,7 +542,7 @@ fn build_window(application: &adw::Application) {
         move |percent| feedback.set_zoom(percent)
     });
 
-    let navigator = Navigator::new(&canvas, &feedback);
+    let navigator = Navigator::new(&canvas, &feedback, initial_path);
     apply_session_to_canvas(&canvas, &navigator.session.borrow().preferences);
     apply_session_style(&canvas, &navigator.session.borrow().preferences);
     apply_theme(navigator.session.borrow().preferences.theme);
@@ -543,10 +610,16 @@ fn build_window(application: &adw::Application) {
     });
     window.present();
     refresh_status_quiet(&window, &canvas, &feedback, "Ready");
+    AppState {
+        window,
+        canvas,
+        navigator,
+        feedback,
+    }
 }
 
 impl Navigator {
-    fn new(canvas: &Canvas, feedback: &Feedback) -> Self {
+    fn new(canvas: &Canvas, feedback: &Feedback, initial_path: Option<&Path>) -> Self {
         let page_list = boxed_list("page-list");
         let layer_list = boxed_list("layer-list");
         let section_list = boxed_list("section-list");
@@ -1148,7 +1221,15 @@ impl Navigator {
                 }
             }
         });
-        open_startup_notebook(canvas, &navigator, feedback);
+        if let Some(path) = initial_path {
+            if let Err(error) = canvas.load(path) {
+                feedback.whisper(error.to_string());
+            } else {
+                let _ = navigator.session.borrow_mut().remember(path);
+            }
+        } else {
+            open_startup_notebook(canvas, &navigator, feedback);
+        }
         navigator.refresh_library(canvas);
         navigator.refresh(canvas);
         navigator.watch_library(canvas);
@@ -4571,8 +4652,8 @@ fn install_actions(
         let canvas = canvas.clone();
         let status = status.clone();
         move || match canvas.calculate_selection_or_pending() {
-            Some(result) => status.show(format!("Calculated {result}")),
-            None => status.whisper("Type an equation that ends with ="),
+            Ok(result) => status.show(format!("Calculated {result}")),
+            Err(err) => status.whisper(err),
         }
     });
     add_action(window, "open-attachment", {

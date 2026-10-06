@@ -337,8 +337,6 @@ enum Interaction {
         last_screen: Point,
     },
     Erase {
-        page_id: Uuid,
-        layer_id: Uuid,
         last: Point,
         before: Vec<ElementSlot>,
         changed: bool,
@@ -371,22 +369,6 @@ enum Interaction {
         source: CellRange,
         current: CellAddr,
     },
-    TransformSelection {
-        handle: HandleKind,
-        start: Point,
-        bounds: Rect,
-        originals: Vec<(Uuid, Element)>,
-        before: Vec<ElementSlot>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HandleKind {
-    Nw,
-    Ne,
-    Sw,
-    Se,
-    Rotate,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1606,10 +1588,11 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    pub fn calculate_selection_or_pending(&self) -> Option<String> {
+    pub fn calculate_selection_or_pending(&self) -> Result<String, String> {
         let mut state = self.state.borrow_mut();
         let selected = state.selection.clone();
         let mut updated = None;
+        let mut last_error = None;
         for element in state
             .page_mut()
             .layers
@@ -1618,27 +1601,44 @@ impl Canvas {
         {
             if let Element::Text(text) = element
                 && selected.contains(&text.id)
-                && let Some(result) = local::evaluate_equation(&text.text)
             {
-                text.text = result.clone();
-                updated = Some(result);
+                match local::evaluate_equation_result(&text.text) {
+                    Ok(result) => {
+                        text.text = result.clone();
+                        updated = Some(result);
+                    }
+                    Err(err) => {
+                        last_error = Some(err.to_string());
+                    }
+                }
             }
         }
-        if updated.is_none()
-            && let Some(result) = local::evaluate_equation(&state.pending_text)
-        {
-            state.pending_text = result.clone();
-            updated = Some(result);
+        if updated.is_none() {
+            match local::evaluate_equation_result(&state.pending_text) {
+                Ok(result) => {
+                    state.pending_text = result.clone();
+                    updated = Some(result);
+                }
+                Err(err) => {
+                    if last_error.is_none() {
+                        last_error = Some(err.to_string());
+                    }
+                }
+            }
         }
         if updated.is_some() {
             state.dirty = true;
         }
         drop(state);
-        if updated.is_some() {
+        if let Some(result) = updated {
             self.schedule_autosave();
             self.area.queue_draw();
+            Ok(result)
+        } else if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Err("Type an equation that ends with =".to_owned())
         }
-        updated
     }
 
     pub fn open_selected_attachment(&self) -> Result<bool, DocumentError> {
@@ -4615,11 +4615,7 @@ impl CanvasState {
                     .collect();
                 let before = self.capture_elements(&ids);
                 let changed = self.erase_at(world);
-                let page_id = self.page().id;
-                let layer_id = self.active_layer().id;
                 self.interaction = Some(Interaction::Erase {
-                    page_id,
-                    layer_id,
                     last: world,
                     before,
                     changed,
@@ -4884,7 +4880,6 @@ impl CanvasState {
                     erase_point = Some(world);
                 }
             }
-            Some(Interaction::TransformSelection { .. }) => {}
             Some(Interaction::Resize { .. })
             | Some(Interaction::Rotate { .. })
             | Some(Interaction::Space { .. })
@@ -5343,24 +5338,6 @@ impl CanvasState {
                 self.sheet_range = Some(target);
                 if target != source {
                     self.fill_sheet_range(source, target);
-                }
-            }
-            Interaction::TransformSelection {
-                before, originals, ..
-            } => {
-                let changed = originals.iter().any(|(id, original)| {
-                    self.page()
-                        .elements()
-                        .find(|element| element.id() == *id)
-                        .is_some_and(|current| current != original)
-                });
-                if changed {
-                    let page_id = self.page().id;
-                    self.push_history(HistoryEntry::ElementsChanged {
-                        page_id,
-                        slots: before,
-                    });
-                    self.dirty = true;
                 }
             }
         }
@@ -5987,7 +5964,7 @@ fn stylus_pressure(state: &CanvasState, gesture: &gtk::GestureStylus, include_ti
     let tilt = if include_tilt && state.runtime.use_tilt {
         gesture
             .axis(gdk::AxisUse::Xtilt)
-            .and_then(|x| gesture.axis(gdk::AxisUse::Ytilt).map(|y| (x, y)))
+            .zip(gesture.axis(gdk::AxisUse::Ytilt))
             .map(|(x, y)| (x.abs() + y.abs()) as f32 * 0.35)
             .unwrap_or(0.0)
     } else {
@@ -7030,7 +7007,6 @@ fn draw_interaction(context: &Context, state: &CanvasState) {
         | Some(Interaction::SheetGrow { .. })
         | Some(Interaction::SheetColResize { .. })
         | Some(Interaction::SheetRowResize { .. })
-        | Some(Interaction::TransformSelection { .. })
         | None => {}
         Some(Interaction::SheetSelect { start, current }) => {
             draw_sheet_range_preview(context, state, CellRange::new(*start, *current));

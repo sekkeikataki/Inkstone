@@ -1489,7 +1489,7 @@ fn eval_call(name: &str, args: &[Expr], ctx: &mut EvalContext<'_>) -> Value {
             (Err(kind), _) | (_, Err(kind)) => Value::Error(kind),
         },
         "FACT" => unary_num_checked(args, ctx, |n| {
-            if n < 0.0 || n > 170.0 {
+            if !(0.0..=170.0).contains(&n) {
                 Err(ErrorKind::Num)
             } else {
                 Ok((1..=n.round() as u32).map(f64::from).product())

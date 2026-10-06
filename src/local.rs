@@ -199,15 +199,46 @@ pub fn tag_element(origin: Point, kind: TagKind) -> Element {
     })
 }
 
-pub fn evaluate_equation(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    let (expr, _) = trimmed.split_once('=')?;
-    if !trimmed.ends_with('=') || trimmed.matches('=').count() != 1 {
-        return None;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EquationError {
+    NotAnEquation,
+    InvalidNumber(String),
+    UnexpectedCharacter(char),
+    SyntaxError(String),
+    DivideByZero,
+    NonFinite,
+}
+
+impl std::fmt::Display for EquationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnEquation => write!(f, "Equation must end with '='"),
+            Self::InvalidNumber(s) => write!(f, "Invalid number: '{s}'"),
+            Self::UnexpectedCharacter(c) => write!(f, "Unexpected character: '{c}'"),
+            Self::SyntaxError(s) => write!(f, "Syntax error: {s}"),
+            Self::DivideByZero => write!(f, "Division by zero"),
+            Self::NonFinite => write!(f, "Result is non-finite"),
+        }
     }
+}
+
+impl std::error::Error for EquationError {}
+
+pub fn evaluate_equation(input: &str) -> Option<String> {
+    evaluate_equation_result(input).ok()
+}
+
+pub fn evaluate_equation_result(input: &str) -> Result<String, EquationError> {
+    let trimmed = input.trim();
+    if !trimmed.ends_with('=') || trimmed.matches('=').count() != 1 {
+        return Err(EquationError::NotAnEquation);
+    }
+    let (expr, _) = trimmed
+        .split_once('=')
+        .ok_or(EquationError::NotAnEquation)?;
     let value = eval_expr(expr.trim())?;
     if !value.is_finite() {
-        return None;
+        return Err(EquationError::NonFinite);
     }
     let rendered = if (value - value.round()).abs() < 1e-9 {
         format!("{trimmed} {}", value.round() as i64)
@@ -217,17 +248,17 @@ pub fn evaluate_equation(input: &str) -> Option<String> {
             .trim_end_matches('.')
             .to_owned()
     };
-    Some(rendered)
+    Ok(rendered)
 }
 
-fn eval_expr(input: &str) -> Option<f64> {
+fn eval_expr(input: &str) -> Result<f64, EquationError> {
     let tokens = tokenize(input)?;
     let mut index = 0;
     let value = parse_sum(&tokens, &mut index)?;
     if index == tokens.len() {
-        Some(value)
+        Ok(value)
     } else {
-        None
+        Err(EquationError::SyntaxError("unexpected tokens after expression".to_owned()))
     }
 }
 
@@ -242,7 +273,7 @@ enum Token {
     RParen,
 }
 
-fn tokenize(input: &str) -> Option<Vec<Token>> {
+fn tokenize(input: &str) -> Result<Vec<Token>, EquationError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut index = 0;
@@ -275,25 +306,35 @@ fn tokenize(input: &str) -> Option<Vec<Token>> {
             }
             '0'..='9' | '.' => {
                 let start = index;
-                index += 1;
-                while index < chars.len() && (chars[index].is_ascii_digit() || chars[index] == '.')
-                {
+                let mut dot_count = 0;
+                let mut digit_count = 0;
+                while index < chars.len() && (chars[index].is_ascii_digit() || chars[index] == '.') {
+                    if chars[index] == '.' {
+                        dot_count += 1;
+                    } else {
+                        digit_count += 1;
+                    }
                     index += 1;
                 }
-                let number = chars[start..index]
-                    .iter()
-                    .collect::<String>()
-                    .parse()
-                    .ok()?;
+                let raw: String = chars[start..index].iter().collect();
+                if dot_count > 1 || digit_count == 0 {
+                    return Err(EquationError::InvalidNumber(raw));
+                }
+                let number = raw
+                    .parse::<f64>()
+                    .map_err(|_| EquationError::InvalidNumber(raw))?;
                 tokens.push(Token::Number(number));
             }
-            _ => return None,
+            other => return Err(EquationError::UnexpectedCharacter(other)),
         }
     }
-    Some(tokens)
+    if tokens.is_empty() {
+        return Err(EquationError::SyntaxError("empty expression".to_owned()));
+    }
+    Ok(tokens)
 }
 
-fn parse_sum(tokens: &[Token], index: &mut usize) -> Option<f64> {
+fn parse_sum(tokens: &[Token], index: &mut usize) -> Result<f64, EquationError> {
     let mut value = parse_product(tokens, index)?;
     while let Some(token) = tokens.get(*index) {
         match token {
@@ -308,10 +349,10 @@ fn parse_sum(tokens: &[Token], index: &mut usize) -> Option<f64> {
             _ => break,
         }
     }
-    Some(value)
+    Ok(value)
 }
 
-fn parse_product(tokens: &[Token], index: &mut usize) -> Option<f64> {
+fn parse_product(tokens: &[Token], index: &mut usize) -> Result<f64, EquationError> {
     let mut value = parse_unary(tokens, index)?;
     while let Some(token) = tokens.get(*index) {
         match token {
@@ -323,17 +364,17 @@ fn parse_product(tokens: &[Token], index: &mut usize) -> Option<f64> {
                 *index += 1;
                 let divisor = parse_unary(tokens, index)?;
                 if divisor.abs() < f64::EPSILON {
-                    return None;
+                    return Err(EquationError::DivideByZero);
                 }
                 value /= divisor;
             }
             _ => break,
         }
     }
-    Some(value)
+    Ok(value)
 }
 
-fn parse_unary(tokens: &[Token], index: &mut usize) -> Option<f64> {
+fn parse_unary(tokens: &[Token], index: &mut usize) -> Result<f64, EquationError> {
     match tokens.get(*index) {
         Some(Token::Plus) => {
             *index += 1;
@@ -341,28 +382,29 @@ fn parse_unary(tokens: &[Token], index: &mut usize) -> Option<f64> {
         }
         Some(Token::Minus) => {
             *index += 1;
-            Some(-parse_unary(tokens, index)?)
+            let val = parse_unary(tokens, index)?;
+            Ok(-val)
         }
         _ => parse_primary(tokens, index),
     }
 }
 
-fn parse_primary(tokens: &[Token], index: &mut usize) -> Option<f64> {
+fn parse_primary(tokens: &[Token], index: &mut usize) -> Result<f64, EquationError> {
     match tokens.get(*index).copied() {
         Some(Token::Number(value)) => {
             *index += 1;
-            Some(value)
+            Ok(value)
         }
         Some(Token::LParen) => {
             *index += 1;
             let value = parse_sum(tokens, index)?;
             if !matches!(tokens.get(*index), Some(Token::RParen)) {
-                return None;
+                return Err(EquationError::SyntaxError("missing closing parenthesis".to_owned()));
             }
             *index += 1;
-            Some(value)
+            Ok(value)
         }
-        _ => None,
+        _ => Err(EquationError::SyntaxError("expected number or expression".to_owned())),
     }
 }
 

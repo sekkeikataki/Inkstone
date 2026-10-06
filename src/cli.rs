@@ -24,6 +24,9 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
             | "--cli"
             | "--help-cli"
             | "-h-cli"
+            | "--help"
+            | "-h"
+            | "help"
     )
 }
 
@@ -57,7 +60,7 @@ pub fn run(args: &[String]) -> u8 {
         "export-markdown" => cmd_export_markdown(rest),
         "batch" => cmd_batch(rest),
         other => {
-            eprintln!("Unknown CLI command: {other}. Use 'inkstone --help-cli' for usage.");
+            eprintln!("Unknown CLI command: {other}. Use 'inkstone --help' for usage.");
             1
         }
     }
@@ -131,8 +134,10 @@ fn cmd_new(args: &[String]) -> u8 {
         }
     }
 
-    let mut notebook = Notebook::default();
-    notebook.title = title;
+    let mut notebook = Notebook {
+        title,
+        ..Default::default()
+    };
     let colors = [
         Color::BLUE,
         Color::rgb(0.05, 0.56, 0.32),
@@ -333,12 +338,11 @@ fn cmd_import_dir(args: &[String]) -> u8 {
     let mut md_files: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_file() {
-            if let Some(ext) = p.extension() {
-                if ext == "md" || ext == "markdown" || ext == "txt" {
-                    md_files.push(p);
-                }
-            }
+        if p.is_file()
+            && p.extension()
+                .is_some_and(|ext| ext == "md" || ext == "markdown" || ext == "txt")
+        {
+            md_files.push(p);
         }
     }
     md_files.sort();
@@ -466,8 +470,8 @@ fn cmd_export_markdown(args: &[String]) -> u8 {
         let mut md = format!("# {}\n\n", page.title);
         for layer in &page.layers {
             for elem in &layer.elements {
-                if let Element::Text(txt) = elem {
-                    match txt.list {
+                match elem {
+                    Element::Text(txt) => match txt.list {
                         ListStyle::Bullet => md.push_str(&format!("- {}\n", txt.text)),
                         ListStyle::Numbered => md.push_str(&format!("1. {}\n", txt.text)),
                         ListStyle::Checklist => {
@@ -483,11 +487,80 @@ fn cmd_export_markdown(args: &[String]) -> u8 {
                                 md.push_str(&format!("{}\n\n", txt.text));
                             }
                         }
+                    },
+                    Element::Table(tbl) => {
+                        if tbl.columns > 0 && tbl.rows > 0 {
+                            for r in 0..tbl.rows {
+                                let row_cells: Vec<String> = (0..tbl.columns)
+                                    .map(|c| {
+                                        let idx = (r * tbl.columns + c) as usize;
+                                        let val = tbl.cells.get(idx).map(|s| s.as_str()).unwrap_or("");
+                                        val.replace('|', "\\|").replace('\n', " ")
+                                    })
+                                    .collect();
+                                md.push_str(&format!("| {} |\n", row_cells.join(" | ")));
+                                if r == 0 {
+                                    let sep: Vec<&str> = vec!["---"; tbl.columns as usize];
+                                    md.push_str(&format!("| {} |\n", sep.join(" | ")));
+                                }
+                            }
+                            md.push('\n');
+                        }
                     }
+                    Element::Shape(shape) => {
+                        let kind = format!("{:?}", shape.kind);
+                        if !shape.label.trim().is_empty() {
+                            md.push_str(&format!("> **[{kind}]** {}\n\n", shape.label.trim()));
+                        } else {
+                            md.push_str(&format!("> *[{kind}]*\n\n"));
+                        }
+                    }
+                    Element::Tag(tag) => {
+                        let mark = if tag.checked { "x" } else { " " };
+                        let kind = format!("{:?}", tag.kind);
+                        md.push_str(&format!("- [{mark}] #{kind}: {}\n\n", tag.note));
+                    }
+                    Element::Media(media) => {
+                        let alt = if !media.alt_text.is_empty() {
+                            &media.alt_text
+                        } else if !media.caption.is_empty() {
+                            &media.caption
+                        } else {
+                            "media"
+                        };
+                        md.push_str(&format!("![{alt}](asset://{})\n\n", media.asset_id));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(spreadsheet) = &layer.spreadsheet {
+                for sheet in &spreadsheet.sheets {
+                    if sheet.cells.is_empty() {
+                        continue;
+                    }
+                    md.push_str(&format!("### Sheet: {}\n\n", sheet.name));
+                    let range = sheet.used_range();
+                    let col_names: Vec<String> = (range.start.col..=range.end.col)
+                        .map(crate::spreadsheet::address::col_name)
+                        .collect();
+                    md.push_str(&format!("| | {} |\n", col_names.join(" | ")));
+                    let sep: Vec<&str> = vec!["---"; (range.end.col - range.start.col + 2) as usize];
+                    md.push_str(&format!("|{}|\n", sep.join("|")));
+                    for r in range.start.row..=range.end.row {
+                        let row_num = r + 1;
+                        let mut row_vals = vec![row_num.to_string()];
+                        for c in range.start.col..=range.end.col {
+                            let addr = crate::spreadsheet::address::CellAddr { col: c, row: r };
+                            let val = sheet.cells.get(&addr).map(|cell| cell.input.as_str()).unwrap_or("");
+                            row_vals.push(val.replace('|', "\\|").replace('\n', " "));
+                        }
+                        md.push_str(&format!("| {} |\n", row_vals.join(" | ")));
+                    }
+                    md.push('\n');
                 }
             }
         }
-        let safe_title = page.title.replace('/', "_").replace('\\', "_");
+        let safe_title = page.title.replace(['/', '\\'], "_");
         let filename = format!("{:02}_{}.md", idx + 1, safe_title);
         let dest = out_dir.join(filename);
         let _ = fs::write(&dest, md);
@@ -661,9 +734,35 @@ fn cmd_batch(args: &[String]) -> u8 {
                     y += 26.0;
                     elements.push(Element::Text(note));
                 }
+                "heading" | "h" => {
+                    let lvl = b.level.unwrap_or(1);
+                    if lvl == 1 {
+                        y += 20.0;
+                        let mut note = TextNote::plain(Point::new(60.0, y), b.text, 24.0, Color::INK);
+                        note.bold = true;
+                        note.max_width = Some(800.0);
+                        y += 40.0;
+                        elements.push(Element::Text(note));
+                    } else if lvl == 2 {
+                        y += 15.0;
+                        let mut note = TextNote::plain(Point::new(60.0, y), b.text, 18.0, Color::BLUE);
+                        note.bold = true;
+                        note.max_width = Some(800.0);
+                        y += 32.0;
+                        elements.push(Element::Text(note));
+                    } else {
+                        y += 10.0;
+                        let mut note = TextNote::plain(Point::new(60.0, y), b.text, 15.0, Color::INK);
+                        note.bold = true;
+                        note.max_width = Some(800.0);
+                        y += 26.0;
+                        elements.push(Element::Text(note));
+                    }
+                }
                 "bullet" => {
+                    let indent = b.level.unwrap_or(0) as f32 * 20.0;
                     let lines = b.text.lines().count().max(1);
-                    let mut note = TextNote::plain(Point::new(60.0, y), b.text, 14.0, Color::INK);
+                    let mut note = TextNote::plain(Point::new(60.0 + indent, y), b.text, 14.0, Color::INK);
                     note.list = ListStyle::Bullet;
                     note.max_width = Some(800.0);
                     y += (lines as f32) * 20.0 + 8.0;
