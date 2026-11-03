@@ -1128,25 +1128,7 @@ impl Element {
                 }
                 bounds.expand(stroke.style.width)
             }
-            Self::Text(text) => {
-                let prefix = text.prefix().chars().count() as f32;
-                let longest = text
-                    .text
-                    .lines()
-                    .map(|line| line.chars().count())
-                    .max()
-                    .unwrap_or(1) as f32
-                    + prefix;
-                let lines = text.text.lines().count().max(1) as f32;
-                Rect {
-                    x: text.origin.x,
-                    y: text.origin.y - text.font_size,
-                    width: text
-                        .max_width
-                        .unwrap_or((longest * text.font_size * 0.62).max(text.font_size)),
-                    height: lines * text.font_size * 1.25,
-                }
-            }
+            Self::Text(text) => text_bounds(text),
             Self::Shape(shape) => shape.bounds.normalized().expand(shape.style.width + 4.0),
             Self::Connector(connector) => {
                 let mut bounds = Rect::from_points(connector.start.point, connector.end.point);
@@ -1671,6 +1653,132 @@ impl Document {
     }
 }
 
+fn text_bounds(text: &TextNote) -> Rect {
+    if crate::math::has_math(&text.text) {
+        let layout = crate::math::layout_note(
+            &text.text,
+            crate::math::NoteStyle {
+                font_size: text.font_size,
+                bold: text.bold,
+                italic: text.italic,
+                underline: text.underline || text.href.is_some(),
+                prefix: text.prefix(),
+            },
+            &crate::math::Estimate,
+        );
+        let pad = text.font_size * 0.08;
+        return Rect {
+            x: text.origin.x - pad,
+            y: text.origin.y - layout.ascent - pad,
+            width: (layout.width + pad * 2.0).max(text.font_size),
+            height: (layout.height + pad * 2.0).max(text.font_size),
+        };
+    }
+    let prefix = text.prefix().chars().count() as f32;
+    let longest = text
+        .text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(1) as f32
+        + prefix;
+    let lines = text.text.lines().count().max(1) as f32;
+    Rect {
+        x: text.origin.x,
+        y: text.origin.y - text.font_size,
+        width: text
+            .max_width
+            .unwrap_or((longest * text.font_size * 0.62).max(text.font_size)),
+        height: lines * text.font_size * 1.25,
+    }
+}
+
+fn math_text_svg(text: &TextNote) -> String {
+    let layout = crate::math::layout_note(
+        &text.text,
+        crate::math::NoteStyle {
+            font_size: text.font_size,
+            bold: text.bold,
+            italic: text.italic,
+            underline: text.underline || text.href.is_some(),
+            prefix: text.prefix(),
+        },
+        &crate::math::Estimate,
+    );
+    let fill = text.color.svg();
+    let mut svg = format!("<g data-inkstone-id=\"{}\" data-kind=\"text\">", text.id);
+    for line in &layout.lines {
+        for op in &line.ops {
+            match op {
+                crate::math::Op::Glyph {
+                    x,
+                    y,
+                    size,
+                    text: glyph,
+                    face,
+                } => {
+                    let (family, slant, weight) = svg_face(*face);
+                    svg.push_str(&format!(
+                        "<text x=\"{}\" y=\"{}\" font-family=\"{family}\" font-size=\"{size}\" \
+                         font-style=\"{slant}\" font-weight=\"{weight}\" fill=\"{fill}\">{}</text>",
+                        text.origin.x + x,
+                        text.origin.y + line.baseline + y,
+                        escape_xml(glyph)
+                    ));
+                }
+                crate::math::Op::Rule {
+                    x,
+                    y,
+                    width,
+                    weight,
+                } => {
+                    let y = text.origin.y + line.baseline + y;
+                    svg.push_str(&format!(
+                        "<line x1=\"{}\" y1=\"{y}\" x2=\"{}\" y2=\"{y}\" stroke=\"{fill}\" stroke-width=\"{weight}\"/>",
+                        text.origin.x + x,
+                        text.origin.x + x + width
+                    ));
+                }
+                crate::math::Op::Path { points, weight } => {
+                    if points.len() < 2 {
+                        continue;
+                    }
+                    let points = points
+                        .iter()
+                        .map(|(x, y)| {
+                            format!(
+                                "{},{}",
+                                text.origin.x + x,
+                                text.origin.y + line.baseline + y
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    svg.push_str(&format!(
+                        "<polyline points=\"{points}\" fill=\"none\" stroke=\"{fill}\" \
+                         stroke-width=\"{weight}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+                    ));
+                }
+            }
+        }
+    }
+    svg.push_str("</g>\n");
+    svg
+}
+
+fn svg_face(face: crate::math::Face) -> (&'static str, &'static str, &'static str) {
+    use crate::math::Face;
+    match face {
+        Face::Roman => ("serif", "normal", "normal"),
+        Face::Italic => ("serif", "italic", "normal"),
+        Face::Bold => ("serif", "normal", "bold"),
+        Face::BoldItalic => ("serif", "italic", "bold"),
+        Face::Sans => ("sans-serif", "normal", "normal"),
+        Face::SansBold => ("sans-serif", "normal", "bold"),
+        Face::SansItalic => ("sans-serif", "italic", "normal"),
+    }
+}
+
 pub(crate) fn element_svg(element: &Element) -> String {
     match element {
         Element::Stroke(stroke) => {
@@ -1692,6 +1800,9 @@ pub(crate) fn element_svg(element: &Element) -> String {
             )
         }
         Element::Text(text) => {
+            if crate::math::has_math(&text.text) {
+                return math_text_svg(text);
+            }
             let weight = if text.bold { "bold" } else { "normal" };
             let style = if text.italic { "italic" } else { "normal" };
             let decoration = if text.underline || text.href.is_some() {

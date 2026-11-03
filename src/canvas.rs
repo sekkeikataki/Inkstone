@@ -3535,6 +3535,10 @@ impl CanvasState {
             self.paste_elements(payload);
             return;
         }
+        if let Some(blocks) = crate::math::pasted_blocks(trimmed) {
+            self.paste_math_blocks(blocks);
+            return;
+        }
         let mut note = TextNote::plain(
             self.screen_to_world(Point::new(48.0, 48.0)),
             trimmed,
@@ -3543,6 +3547,53 @@ impl CanvasState {
         );
         note.max_width = Some(420.0);
         self.add_element(Element::Text(note));
+    }
+
+    fn paste_math_blocks(&mut self, blocks: Vec<crate::math::PasteBlock>) {
+        let origin = self.screen_to_world(Point::new(48.0, 48.0));
+        let page_id = self.page().id;
+        let layer_id = self.active_layer().id;
+        let start_index = self.active_layer().elements.len();
+        let color = self.style.color;
+        let base_size = 18.0;
+        let mut baseline = origin.y;
+        let mut slots = Vec::new();
+        self.selection.clear();
+        for (index, block) in blocks.iter().enumerate() {
+            let font_size = base_size * block.scale;
+            let probe = styled_paste_note(block, Point::new(0.0, 0.0), font_size, color);
+            let probe_bounds = Element::Text(probe).bounds();
+            let ascent = -probe_bounds.y;
+            let note = styled_paste_note(block, Point::new(origin.x, baseline), font_size, color);
+            let id = note.id;
+            self.selection.insert(id);
+            self.active_layer_mut().elements.push(Element::Text(note));
+            slots.push(ElementSlot {
+                layer_id,
+                index: start_index + slots.len(),
+                id,
+                stored: None,
+            });
+            if index + 1 < blocks.len() {
+                let next = &blocks[index + 1];
+                let next_probe =
+                    styled_paste_note(next, Point::new(0.0, 0.0), base_size * next.scale, color);
+                let next_bounds = Element::Text(next_probe).bounds();
+                let gap = if block.list != crate::math::PasteList::None
+                    && next.list != crate::math::PasteList::None
+                {
+                    3.0
+                } else {
+                    8.0
+                };
+                baseline += probe_bounds.height - ascent + gap + (-next_bounds.y);
+            }
+        }
+        if !slots.is_empty() {
+            self.push_history(HistoryEntry::ElementsChanged { page_id, slots });
+            self.dirty = true;
+            self.flash_selection();
+        }
     }
 
     fn paste_pixbuf(&mut self, pixbuf: Pixbuf, name: &str) {
@@ -7353,6 +7404,10 @@ fn apply_dash(context: &Context, dashed: bool, width: f32) {
 }
 
 fn draw_text(context: &Context, text: &TextNote) {
+    if crate::math::has_math(&text.text) {
+        draw_math_text(context, text);
+        return;
+    }
     let bounds = Element::Text(text.clone()).bounds();
     if let Some(highlight) = text.highlight {
         set_source(context, highlight);
@@ -7395,6 +7450,174 @@ fn draw_text(context: &Context, text: &TextNote) {
             context.line_to(text.origin.x as f64 + width, y + 2.0);
             let _ = context.stroke();
         }
+    }
+}
+
+struct CairoMeasurer<'a> {
+    context: &'a Context,
+}
+
+impl crate::math::Measurer for CairoMeasurer<'_> {
+    fn measure(&self, text: &str, size: f32, face: crate::math::Face) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        select_math_face(self.context, face);
+        self.context.set_font_size(size as f64);
+        let measured = self
+            .context
+            .text_extents(text)
+            .ok()
+            .map(|extents| extents.x_advance())
+            .filter(|width| width.is_finite() && *width >= 0.0);
+        measured.unwrap_or_else(|| crate::math::Estimate.measure(text, size, face) as f64) as f32
+    }
+}
+
+fn select_math_face(context: &Context, face: crate::math::Face) {
+    use crate::math::Face;
+    let (family, slant, weight) = match face {
+        Face::Roman => (
+            "Serif",
+            gtk::cairo::FontSlant::Normal,
+            gtk::cairo::FontWeight::Normal,
+        ),
+        Face::Italic => (
+            "Serif",
+            gtk::cairo::FontSlant::Italic,
+            gtk::cairo::FontWeight::Normal,
+        ),
+        Face::Bold => (
+            "Serif",
+            gtk::cairo::FontSlant::Normal,
+            gtk::cairo::FontWeight::Bold,
+        ),
+        Face::BoldItalic => (
+            "Serif",
+            gtk::cairo::FontSlant::Italic,
+            gtk::cairo::FontWeight::Bold,
+        ),
+        Face::Sans => (
+            "Sans",
+            gtk::cairo::FontSlant::Normal,
+            gtk::cairo::FontWeight::Normal,
+        ),
+        Face::SansBold => (
+            "Sans",
+            gtk::cairo::FontSlant::Normal,
+            gtk::cairo::FontWeight::Bold,
+        ),
+        Face::SansItalic => (
+            "Sans",
+            gtk::cairo::FontSlant::Italic,
+            gtk::cairo::FontWeight::Normal,
+        ),
+    };
+    context.select_font_face(family, slant, weight);
+}
+
+fn draw_math_text(context: &Context, text: &TextNote) {
+    let bounds = Element::Text(text.clone()).bounds();
+    if let Some(highlight) = text.highlight {
+        set_source(context, highlight);
+        context.rectangle(
+            bounds.x as f64,
+            bounds.y as f64,
+            bounds.width as f64,
+            bounds.height as f64,
+        );
+        let _ = context.fill();
+    }
+    set_source(context, text.color);
+    context.set_dash(&[], 0.0);
+    let layout = crate::math::layout_note(
+        &text.text,
+        crate::math::NoteStyle {
+            font_size: text.font_size,
+            bold: text.bold,
+            italic: text.italic,
+            underline: text.underline || text.href.is_some(),
+            prefix: text.prefix(),
+        },
+        &CairoMeasurer { context },
+    );
+    for line in &layout.lines {
+        for op in &line.ops {
+            let x = (text.origin.x + op_x(op)) as f64;
+            let y = (text.origin.y + line.baseline + op_y(op)) as f64;
+            match op {
+                crate::math::Op::Glyph {
+                    size,
+                    text: glyph,
+                    face,
+                    ..
+                } => {
+                    select_math_face(context, *face);
+                    context.set_font_size(*size as f64);
+                    context.move_to(x, y);
+                    let _ = context.show_text(glyph);
+                }
+                crate::math::Op::Rule { width, weight, .. } => {
+                    context.set_line_width((*weight as f64).max(0.6));
+                    context.move_to(x, y);
+                    context.line_to(x + *width as f64, y);
+                    let _ = context.stroke();
+                }
+                crate::math::Op::Path { points, weight } => {
+                    if points.len() < 2 {
+                        continue;
+                    }
+                    context.set_line_width((*weight as f64).max(0.6));
+                    context.set_line_cap(LineCap::Round);
+                    context.set_line_join(LineJoin::Round);
+                    let (x0, y0) = points[0];
+                    context.move_to(
+                        (text.origin.x + x0) as f64,
+                        (text.origin.y + line.baseline + y0) as f64,
+                    );
+                    for (px, py) in points.iter().skip(1) {
+                        context.line_to(
+                            (text.origin.x + px) as f64,
+                            (text.origin.y + line.baseline + py) as f64,
+                        );
+                    }
+                    let _ = context.stroke();
+                }
+            }
+        }
+    }
+}
+
+fn styled_paste_note(
+    block: &crate::math::PasteBlock,
+    origin: Point,
+    font_size: f32,
+    color: Color,
+) -> TextNote {
+    let mut note = TextNote::plain(origin, block.text.clone(), font_size, color);
+    note.bold = block.bold;
+    note.italic = block.italic;
+    note.checked = block.checked;
+    note.list = match block.list {
+        crate::math::PasteList::None => ListStyle::None,
+        crate::math::PasteList::Bullet => ListStyle::Bullet,
+        crate::math::PasteList::Numbered => ListStyle::Numbered,
+        crate::math::PasteList::Checklist => ListStyle::Checklist,
+    };
+    note
+}
+
+fn op_x(op: &crate::math::Op) -> f32 {
+    match op {
+        crate::math::Op::Glyph { x, .. } | crate::math::Op::Rule { x, .. } => *x,
+        crate::math::Op::Path { points, .. } => points.first().map(|(x, _)| *x).unwrap_or(0.0),
+    }
+}
+
+fn op_y(op: &crate::math::Op) -> f32 {
+    match op {
+        crate::math::Op::Glyph { y, .. } | crate::math::Op::Rule { y, .. } => *y,
+        crate::math::Op::Path { .. } => 0.0,
     }
 }
 

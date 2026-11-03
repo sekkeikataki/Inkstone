@@ -260,6 +260,40 @@ fn svg_import_reads_polylines_rects_and_text() {
 }
 
 #[test]
+fn latex_from_a_paste_typesets_instead_of_staying_source() {
+    let plain = Element::Text(TextNote::plain(
+        Point::new(12.0, 40.0),
+        "density",
+        18.0,
+        Color::INK,
+    ));
+    let math = Element::Text(TextNote::plain(
+        Point::new(12.0, 40.0),
+        "$$\\rho_0 = \\frac{p}{r \\cdot T}$$",
+        18.0,
+        Color::INK,
+    ));
+    assert!(math.bounds().height > plain.bounds().height);
+    assert!(math.bounds().width > 18.0);
+    let mut document = Document {
+        title: "helium".to_owned(),
+        ..Document::default()
+    };
+    document.elements = vec![math];
+    let svg = document.to_svg();
+    assert!(svg.contains("ρ"));
+    assert!(svg.contains("<line"));
+    assert!(!svg.contains("\\frac"));
+    let blocks = inkstone::math::pasted_blocks(
+        "### Zadání\n\n* hmotnost $m = 350\\text{ kg}$\n\n$$\\frac{p}{r}$$\n",
+    )
+    .expect("gemini math paste");
+    assert!(blocks[0].bold);
+    assert_eq!(blocks[1].list, inkstone::math::PasteList::Bullet);
+    assert!(blocks.iter().any(|block| block.text.contains("\\frac")));
+}
+
+#[test]
 fn color_parse_understands_hex_and_css() {
     assert_eq!(Color::parse("#fff").unwrap(), Color::rgb(1.0, 1.0, 1.0));
     let parsed = Color::parse("rgba(31,97,224,0.5)").unwrap();
