@@ -6,6 +6,7 @@ pub mod cli;
 pub mod document;
 pub mod library;
 pub mod local;
+pub mod math;
 pub mod notebook;
 pub mod pdf;
 pub mod spreadsheet;
